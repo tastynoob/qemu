@@ -38,6 +38,7 @@
 #include "exec/tlb-flags.h"
 #include "qemu/int128.h"
 #include "qemu/atomic128.h"
+#include "target/arm/simtrap.h"
 #include "fpu/softfloat.h"
 #include <zlib.h> /* for crc32 */
 #ifdef CONFIG_USER_ONLY
@@ -116,6 +117,40 @@ void HELPER(msr_i_daifclear)(CPUARMState *env, uint32_t imm)
     daif_check(env, 0x1f, imm, GETPC());
     env->daif &= ~((imm << 6) & PSTATE_DAIF);
     arm_rebuild_hflags(env);
+}
+
+static void a64_simtrap_mask_daif(CPUARMState *env)
+{
+    if (!env->simtrap_daif_masked) {
+        env->simtrap_saved_daif = env->daif;
+        env->simtrap_daif_masked = true;
+    }
+    env->daif |= PSTATE_DAIF;
+    arm_rebuild_hflags(env);
+}
+
+static void a64_simtrap_restore_daif(CPUARMState *env)
+{
+    if (env->simtrap_daif_masked) {
+        env->daif = env->simtrap_saved_daif & PSTATE_DAIF;
+        env->simtrap_daif_masked = false;
+        arm_rebuild_hflags(env);
+    }
+}
+
+void HELPER(a64_simtrap)(CPUARMState *env, uint32_t imm)
+{
+    switch (imm) {
+    case SIMTRAP_DISABLE_TIME_INTR:
+    case A64_SIMTRAP_PROFILE_START:
+        a64_simtrap_mask_daif(env);
+        break;
+    case A64_SIMTRAP_PROFILE_STOP:
+        a64_simtrap_restore_daif(env);
+        break;
+    default:
+        g_assert_not_reached();
+    }
 }
 
 /* Convert a softfloat float_relation_ (as returned by

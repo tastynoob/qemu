@@ -9,6 +9,7 @@ contrib_plugins = [
 'howvec.c',
 'hwprofile.c',
 'ips.c',
+'simpoint.c',
 'stoptrigger.c',
 'traps.c',
 'uftrace.c',
@@ -26,8 +27,12 @@ endif
 t = []
 if get_option('plugins')
   foreach i : contrib_plugins
+    deps = plugins_deps
+    if i == 'simpoint.c'
+      deps = [plugins_deps, zlib]
+    endif
     t += shared_module(fs.stem(i), files(i),
-                       dependencies: plugins_deps)
+                       dependencies: deps)
   endforeach
 endif
 if t.length() > 0

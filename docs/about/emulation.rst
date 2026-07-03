@@ -300,6 +300,51 @@ Example::
   $ du sha1.0.bb
   23128   sha1.0.bb
 
+``contrib/plugins/simpoint.c``
+
+The simpoint plugin generates gzip-compressed SimPoint 3.2 basic block vectors.
+It is intended for system-mode profiling where a single vCPU instruction stream
+is selected for SimPoint analysis.
+
+.. list-table:: SimPoint plugin arguments
+  :widths: 20 80
+  :header-rows: 1
+
+  * - Option
+    - Description
+  * - interval=N
+    - The interval to generate a basic block vector specified by the number of
+      instructions. ``intervals=N`` is also accepted for compatibility.
+  * - target=DIR
+    - Create ``DIR`` and write ``DIR/simpoint_bbv.gz``.
+  * - outfile=PATH
+    - Write the gzip-compressed BBV to ``PATH``.
+  * - cpu=N
+    - Profile vCPU ``N``. The default is ``0``.
+  * - skip=N
+    - Skip the first ``N`` instructions on the profiled vCPU before emitting
+      vectors. ``warmup=N`` is also accepted.
+  * - dump-final=true|false
+    - Emit the final partial interval on exit. The default is ``false``.
+  * - trigger=immediate|simtrap
+    - Start profiling immediately, or wait for AArch64 simtrap instructions.
+      The default is ``immediate``. ``simtrap=true|false`` is also accepted.
+
+AArch64 system-mode profiling can use ``HLT #imm16`` as a simtrap signal.
+The signal values match XiangShan's NEMU trap convention:
+``HLT #0x100`` masks PSTATE ``D/A/I/F`` in QEMU, ``HLT #0x101`` marks
+workload loaded, starts profiling, and also masks ``D/A/I/F`` if needed, and
+``HLT #0x102`` marks workload exit, stops profiling, and restores the previous
+DAIF value. The corresponding encodings are ``.inst 0xd4402000``,
+``.inst 0xd4402020``, and ``.inst 0xd4402040``. The simtrap instructions are
+not counted in the BBV: profiling starts at the instruction after
+``HLT #0x101`` and ends at the instruction before ``HLT #0x102``.
+
+Example::
+
+  $ qemu-system-aarch64 \
+    -plugin contrib/plugins/libsimpoint.so,interval=100000000,target=simpoint,trigger=simtrap
+
 Instruction
 ...........
 

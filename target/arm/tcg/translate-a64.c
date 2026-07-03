@@ -29,6 +29,7 @@
 #include "qemu/log.h"
 #include "semihosting/semihost.h"
 #include "cpregs.h"
+#include "target/arm/simtrap.h"
 
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_gcspr[4];
@@ -3335,6 +3336,13 @@ static bool trans_HLT(DisasContext *s, arg_i *a)
      * it is required for halting debug disabled: it will UNDEF.
      * Secondly, "HLT 0xf000" is the A64 semihosting syscall instruction.
      */
+#ifndef CONFIG_USER_ONLY
+    if (A64_SIMTRAP_IS_HANDLED(a->imm)) {
+        gen_helper_a64_simtrap(tcg_env, tcg_constant_i32(a->imm));
+        s->base.is_jmp = DISAS_UPDATE_EXIT;
+        return true;
+    }
+#endif
     if (semihosting_enabled(s->current_el == 0) && a->imm == 0xf000) {
         gen_exception_internal_insn(s, EXCP_SEMIHOST);
     } else {
