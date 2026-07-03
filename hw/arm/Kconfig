@@ -37,6 +37,13 @@ config ARM_VIRT
     select ACPI_CXL
     select ACPI_HMAT
 
+config MINI_VIRT
+    bool
+    default y
+    depends on TCG && AARCH64
+    select ARM_GIC
+    select PL011 # UART
+
 config CUBIEBOARD
     bool
     default y
