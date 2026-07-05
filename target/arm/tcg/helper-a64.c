@@ -38,6 +38,7 @@
 #include "exec/tlb-flags.h"
 #include "qemu/int128.h"
 #include "qemu/atomic128.h"
+#include "target/arm/a64-checkpoint.h"
 #include "target/arm/simtrap.h"
 #include "fpu/softfloat.h"
 #include <zlib.h> /* for crc32 */
@@ -142,15 +143,24 @@ void HELPER(a64_simtrap)(CPUARMState *env, uint32_t imm)
 {
     switch (imm) {
     case SIMTRAP_DISABLE_TIME_INTR:
-    case A64_SIMTRAP_PROFILE_START:
         a64_simtrap_mask_daif(env);
         break;
+    case A64_SIMTRAP_PROFILE_START:
+        a64_simtrap_mask_daif(env);
+        a64_checkpoint_notify_profiler(env, true);
+        break;
     case A64_SIMTRAP_PROFILE_STOP:
+        a64_checkpoint_notify_profiler(env, false);
         a64_simtrap_restore_daif(env);
         break;
     default:
         g_assert_not_reached();
     }
+}
+
+void HELPER(a64_checkpoint)(CPUARMState *env, uint64_t pc)
+{
+    a64_checkpoint_try_take(env, pc);
 }
 
 /* Convert a softfloat float_relation_ (as returned by

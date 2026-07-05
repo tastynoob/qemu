@@ -175,6 +175,9 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
          * done next -- either exiting this loop or locate the start of
          * the next instruction.
          */
+        if (ops->checkpoint_check) {
+            ops->checkpoint_check(db, cpu);
+        }
         if (ops->cpu_exec_count) {
             tcg_gen_addi_i64(*ops->cpu_exec_count, *ops->cpu_exec_count, 1);
         }

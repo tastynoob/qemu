@@ -15,7 +15,9 @@
 
 #include "qemu/osdep.h"
 #include "qapi/error.h"
+#include "qapi/visitor.h"
 #include "qobject/qlist.h"
+#include "qemu/cutils.h"
 #include "qemu/error-report.h"
 #include "qemu/units.h"
 #include "hw/arm/bsa.h"
@@ -28,6 +30,7 @@
 #include "hw/intc/arm_gicv3.h"
 #include "system/address-spaces.h"
 #include "system/system.h"
+#include "target/arm/a64-checkpoint.h"
 #include "target/arm/cpu.h"
 
 #define MINI_VIRT_RAM_BASE  0x40000000ULL
@@ -37,6 +40,23 @@
 #define MINI_VIRT_NUM_SPIS 256
 #define MINI_VIRT_UART_IRQ 1
 #define MINI_VIRT_ENTRY MINI_VIRT_RAM_BASE
+#define TYPE_MINI_VIRT_MACHINE MACHINE_TYPE_NAME("mini-virt")
+
+typedef struct MiniVirtMachineState {
+    MachineState parent_obj;
+
+    char *checkpoint_mode;
+    char *checkpoint_dir;
+    char *cutpoints;
+    char *cutpoints_file;
+    char *simpoint_path;
+    char *simpoint_file;
+    uint64_t cpt_interval;
+    bool checkpoint_exit_after_last;
+} MiniVirtMachineState;
+
+DECLARE_INSTANCE_CHECKER(MiniVirtMachineState, MINI_VIRT_MACHINE,
+                         TYPE_MINI_VIRT_MACHINE)
 
 static DeviceState *mini_virt_create_gic(DeviceState *cpudev)
 {
@@ -89,13 +109,25 @@ static DeviceState *mini_virt_create_gic(DeviceState *cpudev)
 
 static void mini_virt_init(MachineState *machine)
 {
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(machine);
     Object *cpuobj;
     DeviceState *cpudev;
     DeviceState *gicdev;
     ssize_t image_size;
+    Error *local_err = NULL;
 
     memory_region_add_subregion(get_system_memory(), MINI_VIRT_RAM_BASE,
                                 machine->ram);
+    a64_checkpoint_configure(machine->ram, MINI_VIRT_RAM_BASE,
+                             machine->ram_size, mms->checkpoint_mode,
+                             mms->checkpoint_dir, mms->cutpoints,
+                             mms->cutpoints_file, mms->simpoint_path,
+                             mms->simpoint_file, mms->cpt_interval,
+                             mms->checkpoint_exit_after_last, &local_err);
+    if (local_err) {
+        error_reportf_err(local_err, "mini-virt checkpoint setup failed: ");
+        exit(1);
+    }
 
     cpuobj = object_new(machine->cpu_type);
     if (object_property_find(cpuobj, "rvbar")) {
@@ -126,8 +158,123 @@ static void mini_virt_init(MachineState *machine)
     }
 }
 
+static void mini_virt_set_checkpoint_mode(Object *obj, const char *value,
+                                          Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->checkpoint_mode);
+    mms->checkpoint_mode = g_strdup(value);
+}
+
+static void mini_virt_set_checkpoint_dir(Object *obj, const char *value,
+                                         Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->checkpoint_dir);
+    mms->checkpoint_dir = g_strdup(value);
+}
+
+static void mini_virt_set_cutpoints(Object *obj, const char *value,
+                                    Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->cutpoints);
+    mms->cutpoints = g_strdup(value);
+}
+
+static void mini_virt_set_cutpoints_file(Object *obj, const char *value,
+                                         Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->cutpoints_file);
+    mms->cutpoints_file = g_strdup(value);
+}
+
+static void mini_virt_set_simpoint_path(Object *obj, const char *value,
+                                        Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->simpoint_path);
+    mms->simpoint_path = g_strdup(value);
+}
+
+static void mini_virt_set_simpoint_file(Object *obj, const char *value,
+                                        Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->simpoint_file);
+    mms->simpoint_file = g_strdup(value);
+}
+
+static void mini_virt_set_cpt_interval(Object *obj, const char *value,
+                                       Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+    const char *endp = NULL;
+    uint64_t interval;
+
+    if (qemu_strtou64(value, &endp, 0, &interval) < 0 ||
+        (endp && *endp != '\0')) {
+        error_setg(errp, "invalid cpt-interval '%s'", value);
+        return;
+    }
+    mms->cpt_interval = interval;
+}
+
+static void mini_virt_get_checkpoint_exit_after_last(Object *obj, Visitor *v,
+                                                     const char *name,
+                                                     void *opaque,
+                                                     Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+    bool value = mms->checkpoint_exit_after_last;
+
+    visit_type_bool(v, name, &value, errp);
+}
+
+static void mini_virt_set_checkpoint_exit_after_last(Object *obj, Visitor *v,
+                                                     const char *name,
+                                                     void *opaque,
+                                                     Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+    bool value;
+
+    if (!visit_type_bool(v, name, &value, errp)) {
+        return;
+    }
+    mms->checkpoint_exit_after_last = value;
+}
+
+static void mini_virt_instance_init(Object *obj)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    mms->checkpoint_exit_after_last = true;
+}
+
+static void mini_virt_instance_finalize(Object *obj)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->checkpoint_mode);
+    g_free(mms->checkpoint_dir);
+    g_free(mms->cutpoints);
+    g_free(mms->cutpoints_file);
+    g_free(mms->simpoint_path);
+    g_free(mms->simpoint_file);
+}
+
 static void mini_virt_machine_init(MachineClass *mc)
 {
+    ObjectClass *oc = OBJECT_CLASS(mc);
+
     mc->desc = "minimal AArch64 virtual machine with RAM and one PL011 UART";
     mc->init = mini_virt_init;
     mc->default_cpu_type = ARM_CPU_TYPE_NAME("cortex-a53");
@@ -137,6 +284,45 @@ static void mini_virt_machine_init(MachineClass *mc)
     mc->no_parallel = 1;
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
+
+    object_class_property_add_str(oc, "checkpoint-mode", NULL,
+                                  mini_virt_set_checkpoint_mode);
+    object_class_property_add_str(oc, "checkpoint-dir", NULL,
+                                  mini_virt_set_checkpoint_dir);
+    object_class_property_add_str(oc, "cutpoints", NULL,
+                                  mini_virt_set_cutpoints);
+    object_class_property_add_str(oc, "cutpoints-file", NULL,
+                                  mini_virt_set_cutpoints_file);
+    object_class_property_add_str(oc, "simpoint-path", NULL,
+                                  mini_virt_set_simpoint_path);
+    object_class_property_add_str(oc, "simpoint-file", NULL,
+                                  mini_virt_set_simpoint_file);
+    object_class_property_add_str(oc, "cpt-interval", NULL,
+                                  mini_virt_set_cpt_interval);
+    object_class_property_add(oc, "checkpoint-exit-after-last", "bool",
+                              mini_virt_get_checkpoint_exit_after_last,
+                              mini_virt_set_checkpoint_exit_after_last,
+                              NULL, NULL);
 }
 
-DEFINE_MACHINE_AARCH64("mini-virt", mini_virt_machine_init)
+static void mini_virt_class_init(ObjectClass *oc, const void *data)
+{
+    mini_virt_machine_init(MACHINE_CLASS(oc));
+}
+
+static const TypeInfo mini_virt_typeinfo = {
+    .name = TYPE_MINI_VIRT_MACHINE,
+    .parent = TYPE_MACHINE,
+    .instance_size = sizeof(MiniVirtMachineState),
+    .instance_init = mini_virt_instance_init,
+    .instance_finalize = mini_virt_instance_finalize,
+    .class_init = mini_virt_class_init,
+    .interfaces = aarch64_machine_interfaces,
+};
+
+static void mini_virt_register_types(void)
+{
+    type_register_static(&mini_virt_typeinfo);
+}
+
+type_init(mini_virt_register_types)

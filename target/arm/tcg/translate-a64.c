@@ -29,6 +29,7 @@
 #include "qemu/log.h"
 #include "semihosting/semihost.h"
 #include "cpregs.h"
+#include "target/arm/a64-checkpoint.h"
 #include "target/arm/simtrap.h"
 
 static TCGv_i64 cpu_X[32];
@@ -3344,7 +3345,8 @@ static bool trans_HLT(DisasContext *s, arg_i *a)
 #ifndef CONFIG_USER_ONLY
     if (A64_SIMTRAP_IS_HANDLED(a->imm)) {
         if (a->imm == SIMTRAP_DISABLE_TIME_INTR ||
-            qemu_plugin_a64_simtrap_in_profiling_mode()) {
+            qemu_plugin_a64_simtrap_in_profiling_mode() ||
+            a64_checkpoint_is_enabled()) {
             gen_helper_a64_simtrap(tcg_env, tcg_constant_i32(a->imm));
         }
         s->base.is_jmp = DISAS_UPDATE_EXIT;
@@ -11245,6 +11247,13 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
     emit_delayed_exceptions(dc);
 }
 
+static void aarch64_tr_checkpoint_check(DisasContextBase *db, CPUState *cpu)
+{
+    if (a64_checkpoint_has_pending()) {
+        gen_helper_a64_checkpoint(tcg_env, tcg_constant_i64(db->pc_next));
+    }
+}
+
 const TranslatorOps aarch64_translator_ops = {
     .init_disas_context = aarch64_tr_init_disas_context,
     .tb_start           = aarch64_tr_tb_start,
@@ -11252,6 +11261,7 @@ const TranslatorOps aarch64_translator_ops = {
     .translate_insn     = aarch64_tr_translate_insn,
     .tb_stop            = aarch64_tr_tb_stop,
     .cpu_exec_count     = &cpu_profiling_insns,
+    .checkpoint_check   = aarch64_tr_checkpoint_check,
 };
 
 void aarch64_translate_code(CPUState *cpu, TranslationBlock *tb,

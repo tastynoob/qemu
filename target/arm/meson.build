@@ -51,6 +51,7 @@ arm_common_system_ss.add(when: 'CONFIG_ARM_COMPATIBLE_SEMIHOSTING',
 		                 if_true: files('common-semi-target.c'))
 arm_common_system_ss.add(files(
   'arch_dump.c',
+  'a64-checkpoint.c',
   'arm-powerctl.c',
   'cortex-regs.c',
   'cpregs-omap.c',
