@@ -59,6 +59,9 @@ arm_common_system_ss.add(files(
   'machine.c',
   'ptw.c',
 ))
+if zstd.found()
+  arm_common_system_ss.add(zstd)
+endif
 
 subdir('hvf')
 subdir('whpx')

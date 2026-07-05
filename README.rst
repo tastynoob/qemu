@@ -20,7 +20,7 @@ checkpoint 只用于 CPU 性能测试，不是 QEMU migration，也不是完整 
 
   ninja -C build qemu-system-aarch64 contrib-plugins
 
-示例命令中的 ``<payload.bin>`` 表示 AArch64 raw payload。``mini-virt`` 会把 ``-kernel`` 指定的 raw image 加载到物理地址 ``0x40000000``。
+示例命令中的 ``<payload.bin>`` 表示 AArch64 raw payload。``mini-virt`` 会把 ``-kernel`` 指定的 raw image 加载到物理地址 ``0x40000000``。对于 checkpoint restore，``mini-virt`` 也可以直接加载 ``.zst`` 压缩的 checkpoint image。
 
 建议 profiling、checkpoint 和恢复测试都使用 deterministic icount：
 
@@ -190,11 +190,11 @@ SimPoint cluster 切点命令模板：
 
 .. code-block:: text
 
-  <checkpoint-dir>/<cutpoint>/_<cutpoint>_.bin
+  <checkpoint-dir>/<cutpoint>/_<cutpoint>_.bin.zst
 
 其中 ``<cutpoint>`` 是 profiling window 内的相对指令数，而不是从 reset 开始的全局指令数。
 
-snapshot 是 sparse raw RAM image：
+snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM image：
 
 * 逻辑大小等于 ``-m`` 指定的 RAM 大小。
 * restorer 和原始 payload 保持在 image 低地址区域。
@@ -220,7 +220,7 @@ snapshot 是 sparse raw RAM image：
 恢复 checkpoint
 ===============
 
-恢复时直接把生成的 ``_<cutpoint>_.bin`` 当作 ``mini-virt`` raw payload 启动，不要再开启 ``checkpoint-mode``：
+恢复时直接把生成的 ``_<cutpoint>_.bin.zst`` 当作 ``mini-virt`` payload 启动，不要再开启 ``checkpoint-mode``。``mini-virt`` 会在加载时流式解压 ``.zst``：
 
 .. code-block:: shell
 
@@ -231,7 +231,7 @@ snapshot 是 sparse raw RAM image：
     -smp 1 \
     -m <memory-size> \
     -nographic \
-    -kernel <checkpoint.bin> \
+    -kernel <checkpoint.bin.zst> \
     -plugin build/contrib/plugins/libstoptrigger.so,icount=<max-instructions>:0
 
 正常恢复时，串口会先输出 restorer 信息：
@@ -253,7 +253,7 @@ snapshot 是 sparse raw RAM image：
     -smp 1 \
     -m <memory-size> \
     -nographic \
-    -kernel <checkpoint.bin> \
+    -kernel <checkpoint.bin.zst> \
     -plugin build/contrib/plugins/libstoptrigger.so,addr=<restore-pc>:77 \
     -d plugin \
     -D <pc-check-log>
@@ -272,4 +272,4 @@ snapshot 是 sparse raw RAM image：
 2. 使用 ``libsimpoint.so,trigger=simtrap`` 运行 workload，得到 ``simpoint_bbv.gz``。
 3. 使用 SimPoint 3.2 对 BBV 做 cluster，得到 ``simpoints0``。
 4. 使用 ``checkpoint-mode=SimpointCheckpoint,simpoint-path=<path>,cpt-interval=<interval>`` 生成 checkpoints。
-5. 直接启动 ``_<cutpoint>_.bin`` 做恢复验证和后续 CPU 性能测试。
+5. 直接启动 ``_<cutpoint>_.bin.zst`` 做恢复验证和后续 CPU 性能测试。

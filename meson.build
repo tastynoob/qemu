@@ -1375,7 +1375,7 @@ if not get_option('libiscsi').auto() or have_block
                          method: 'pkg-config')
 endif
 zstd = not_found
-if not get_option('zstd').auto() or have_block
+if not get_option('zstd').auto() or have_block or have_system
   zstd = dependency('libzstd', version: '>=1.4.0',
                     required: get_option('zstd'),
                     method: 'pkg-config')

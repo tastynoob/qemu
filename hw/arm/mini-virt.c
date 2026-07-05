@@ -33,6 +33,10 @@
 #include "target/arm/a64-checkpoint.h"
 #include "target/arm/cpu.h"
 
+#ifdef CONFIG_ZSTD
+#include <zstd.h>
+#endif
+
 #define MINI_VIRT_RAM_BASE  0x40000000ULL
 #define MINI_VIRT_UART_BASE 0x09000000ULL
 #define MINI_VIRT_GIC_DIST_BASE   0x08000000ULL
@@ -40,6 +44,7 @@
 #define MINI_VIRT_NUM_SPIS 256
 #define MINI_VIRT_UART_IRQ 1
 #define MINI_VIRT_ENTRY MINI_VIRT_RAM_BASE
+#define MINI_VIRT_ZSTD_CHUNK_SIZE (1 * MiB)
 #define TYPE_MINI_VIRT_MACHINE MACHINE_TYPE_NAME("mini-virt")
 
 typedef struct MiniVirtMachineState {
@@ -57,6 +62,125 @@ typedef struct MiniVirtMachineState {
 
 DECLARE_INSTANCE_CHECKER(MiniVirtMachineState, MINI_VIRT_MACHINE,
                          TYPE_MINI_VIRT_MACHINE)
+
+static bool mini_virt_payload_is_zstd(const char *filename)
+{
+    return g_str_has_suffix(filename, ".zst") ||
+           g_str_has_suffix(filename, ".zstd");
+}
+
+#ifdef CONFIG_ZSTD
+static ssize_t mini_virt_load_zstd_payload(const char *filename,
+                                           MemoryRegion *ram,
+                                           uint64_t max_sz,
+                                           Error **errp)
+{
+    g_autofree uint8_t *inbuf = g_malloc(MINI_VIRT_ZSTD_CHUNK_SIZE);
+    g_autofree uint8_t *outbuf = g_malloc(MINI_VIRT_ZSTD_CHUNK_SIZE);
+    uint8_t *ram_ptr = memory_region_get_ram_ptr(ram);
+    ZSTD_DCtx *dctx = NULL;
+    uint64_t loaded = 0;
+    size_t zret = 0;
+    int fd;
+
+    fd = qemu_open(filename, O_RDONLY | O_BINARY, errp);
+    if (fd < 0) {
+        return -1;
+    }
+
+    dctx = ZSTD_createDCtx();
+    if (!dctx) {
+        error_setg(errp, "failed to create zstd decompression context");
+        close(fd);
+        return -1;
+    }
+
+    for (;;) {
+        ssize_t rd;
+
+        do {
+            rd = read(fd, inbuf, MINI_VIRT_ZSTD_CHUNK_SIZE);
+        } while (rd < 0 && errno == EINTR);
+
+        if (rd < 0) {
+            error_setg_errno(errp, errno, "failed to read '%s'", filename);
+            ZSTD_freeDCtx(dctx);
+            close(fd);
+            return -1;
+        }
+        if (rd == 0) {
+            break;
+        }
+
+        ZSTD_inBuffer input = {
+            .src = inbuf,
+            .size = rd,
+            .pos = 0,
+        };
+
+        while (input.pos < input.size) {
+            ZSTD_outBuffer output = {
+                .dst = outbuf,
+                .size = MINI_VIRT_ZSTD_CHUNK_SIZE,
+                .pos = 0,
+            };
+
+            zret = ZSTD_decompressStream(dctx, &output, &input);
+            if (ZSTD_isError(zret)) {
+                error_setg(errp, "failed to decompress '%s': %s",
+                           filename, ZSTD_getErrorName(zret));
+                ZSTD_freeDCtx(dctx);
+                close(fd);
+                return -1;
+            }
+
+            if (output.pos > 0) {
+                if (loaded + output.pos > max_sz) {
+                    error_setg(errp, "'%s' exceeds maximum image size",
+                               filename);
+                    ZSTD_freeDCtx(dctx);
+                    close(fd);
+                    return -1;
+                }
+
+                memcpy(ram_ptr + loaded, outbuf, output.pos);
+                loaded += output.pos;
+            }
+        }
+    }
+
+    if (zret != 0) {
+        error_setg(errp, "truncated zstd payload '%s'", filename);
+        ZSTD_freeDCtx(dctx);
+        close(fd);
+        return -1;
+    }
+    if (loaded == 0) {
+        error_setg(errp, "empty zstd payload '%s'", filename);
+        ZSTD_freeDCtx(dctx);
+        close(fd);
+        return -1;
+    }
+
+    ZSTD_freeDCtx(dctx);
+    if (close(fd) < 0) {
+        error_setg_errno(errp, errno, "failed to close '%s'", filename);
+        return -1;
+    }
+
+    return loaded;
+}
+#else
+static ssize_t mini_virt_load_zstd_payload(const char *filename,
+                                           MemoryRegion *ram,
+                                           uint64_t max_sz,
+                                           Error **errp)
+{
+    error_setg(errp, "zstd-compressed payload '%s' requires QEMU built "
+               "with --enable-zstd", filename);
+    return -1;
+}
+#endif
 
 static DeviceState *mini_virt_create_gic(DeviceState *cpudev)
 {
@@ -146,13 +270,25 @@ static void mini_virt_init(MachineState *machine)
                  serial_hd(0));
 
     if (machine->kernel_filename) {
-        image_size = load_image_targphys(machine->kernel_filename,
-                                         MINI_VIRT_ENTRY,
-                                         machine->ram_size,
-                                         &error_fatal);
+        if (mini_virt_payload_is_zstd(machine->kernel_filename)) {
+            image_size = mini_virt_load_zstd_payload(machine->kernel_filename,
+                                                     machine->ram,
+                                                     machine->ram_size,
+                                                     &local_err);
+        } else {
+            image_size = load_image_targphys(machine->kernel_filename,
+                                             MINI_VIRT_ENTRY,
+                                             machine->ram_size,
+                                             &local_err);
+        }
         if (image_size < 0) {
-            error_report("could not load payload '%s'",
-                         machine->kernel_filename);
+            if (local_err) {
+                error_reportf_err(local_err, "could not load payload '%s': ",
+                                  machine->kernel_filename);
+            } else {
+                error_report("could not load payload '%s'",
+                             machine->kernel_filename);
+            }
             exit(1);
         }
     }

@@ -18,6 +18,10 @@
 #include "target/arm/a64-checkpoint.h"
 #include "internals.h"
 
+#ifdef CONFIG_ZSTD
+#include <zstd.h>
+#endif
+
 #define A64_CPT_MAGIC_NUMBER UINT64_C(0xdeadbeef)
 #define A64_CPT_CORE_MAGIC_NUMBER UINT64_C(0xbeef)
 #define A64_CPT_VERSION UINT64_C(0x20260705)
@@ -25,6 +29,8 @@
 #define A64_CPT_RESTORER_RESERVED_SIZE UINT64_C(0x100000)
 #define A64_CPT_DEFAULT_HEADER_OFFSET A64_CPT_RESTORER_RESERVED_SIZE
 #define A64_CPT_METADATA_ALIGN UINT64_C(0x1000)
+#define A64_CPT_ZSTD_CHUNK_SIZE (1 * MiB)
+#define A64_CPT_ZSTD_LEVEL 1
 
 #define A64_CPT_FLAG_HAS_FPSIMD (UINT64_C(1) << 0)
 
@@ -73,6 +79,12 @@
 typedef struct A64CheckpointPoint {
     uint64_t insns;
 } A64CheckpointPoint;
+
+typedef struct A64CheckpointOverlay {
+    uint64_t offset;
+    const uint8_t *data;
+    size_t len;
+} A64CheckpointOverlay;
 
 typedef struct A64CheckpointState {
     bool enabled;
@@ -276,52 +288,94 @@ static bool parse_simpoint_path(const char *simpoint_path,
     return parse_cutpoints_file(path, true, cpt_interval, errp);
 }
 
-static int pwrite_full(int fd, const void *buf, size_t len, off_t offset)
+#ifdef CONFIG_ZSTD
+static int write_full_fd(int fd, const void *buf, size_t len)
 {
-    const uint8_t *p = buf;
+    ssize_t ret;
 
-    while (len > 0) {
-        ssize_t ret = pwrite(fd, p, len, offset);
-
-        if (ret < 0) {
-            if (errno == EINTR) {
-                continue;
-            }
-            return -errno;
-        }
-        if (ret == 0) {
-            return -EIO;
-        }
-        p += ret;
-        offset += ret;
-        len -= ret;
+    ret = qemu_write_full(fd, buf, len);
+    if (ret == len) {
+        return 0;
     }
-    return 0;
+    return errno ? -errno : -EIO;
 }
 
-static int write_sparse_ram(int fd, const uint8_t *ram, uint64_t size)
+static bool range_overlaps(uint64_t a_start, uint64_t a_len,
+                           uint64_t b_start, uint64_t b_len)
 {
-    const size_t chunk_size = 1 * MiB;
+    uint64_t a_end = a_start + a_len;
+    uint64_t b_end = b_start + b_len;
 
-    for (uint64_t off = 0; off < size; off += chunk_size) {
-        size_t chunk = MIN((uint64_t)chunk_size, size - off);
-        int ret;
+    return a_start < b_end && b_start < a_end;
+}
 
-        if (buffer_is_zero(ram + off, chunk)) {
+static bool apply_overlays(uint8_t *chunk, uint64_t chunk_offset,
+                           size_t chunk_len,
+                           const A64CheckpointOverlay *overlays,
+                           size_t nr_overlays)
+{
+    bool applied = false;
+
+    for (size_t i = 0; i < nr_overlays; i++) {
+        const A64CheckpointOverlay *overlay = &overlays[i];
+        uint64_t start;
+        uint64_t end;
+
+        if (!range_overlaps(chunk_offset, chunk_len,
+                            overlay->offset, overlay->len)) {
             continue;
         }
 
-        ret = pwrite_full(fd, ram + off, chunk, off);
-        if (ret < 0) {
-            return ret;
-        }
+        start = MAX(chunk_offset, overlay->offset);
+        end = MIN(chunk_offset + chunk_len, overlay->offset + overlay->len);
+        memcpy(chunk + start - chunk_offset,
+               overlay->data + start - overlay->offset,
+               end - start);
+        applied = true;
     }
 
-    if (ftruncate(fd, size) < 0) {
-        return -errno;
-    }
+    return applied;
+}
+
+static int zstd_write_input(ZSTD_CCtx *cctx, int fd, const void *buf,
+                            size_t len, ZSTD_EndDirective directive)
+{
+    g_autofree uint8_t *outbuf = g_malloc(ZSTD_CStreamOutSize());
+    ZSTD_inBuffer input = {
+        .src = buf,
+        .size = len,
+        .pos = 0,
+    };
+    size_t outbuf_size = ZSTD_CStreamOutSize();
+
+    do {
+        ZSTD_outBuffer output = {
+            .dst = outbuf,
+            .size = outbuf_size,
+            .pos = 0,
+        };
+        size_t ret = ZSTD_compressStream2(cctx, &output, &input, directive);
+
+        if (ZSTD_isError(ret)) {
+            error_report("a64 checkpoint: zstd compression failed: %s",
+                         ZSTD_getErrorName(ret));
+            return -EIO;
+        }
+        if (output.pos > 0) {
+            int write_ret = write_full_fd(fd, outbuf, output.pos);
+
+            if (write_ret < 0) {
+                return write_ret;
+            }
+        }
+        if (directive == ZSTD_e_end && ret == 0) {
+            break;
+        }
+    } while (input.pos < input.size || directive == ZSTD_e_end);
+
     return 0;
 }
+#endif
 
 static void write_checkpoint_header(uint8_t *metadata)
 {
@@ -542,31 +596,112 @@ static void write_core_state(uint8_t *core, CPUARMState *env, uint64_t pc)
     put_u64(core, A64_CPT_OFF_FLOAT_DONE, 1);
 }
 
-static int write_metadata(int fd, CPUARMState *env, uint64_t pc)
+static void build_metadata(CPUARMState *env, uint64_t pc,
+                           uint8_t **metadata, size_t *metadata_len,
+                           uint8_t **core, size_t *core_len)
 {
     const uint64_t metadata_size = 40 + 208;
     const uint64_t cpt_offset = ROUND_UP(metadata_size, A64_CPT_METADATA_ALIGN);
-    g_autofree uint8_t *metadata = g_malloc0(cpt_offset);
-    g_autofree uint8_t *core = g_malloc0(A64_CPT_SINGLE_CORE_SIZE);
-    int ret;
 
-    write_checkpoint_header(metadata);
-    write_checkpoint_layout(metadata);
-    write_core_state(core, env, pc);
+    *metadata_len = cpt_offset;
+    *core_len = A64_CPT_SINGLE_CORE_SIZE;
+    *metadata = g_malloc0(*metadata_len);
+    *core = g_malloc0(*core_len);
 
-    ret = pwrite_full(fd, metadata, cpt_offset, A64_CPT_DEFAULT_HEADER_OFFSET);
-    if (ret < 0) {
-        return ret;
-    }
-    return pwrite_full(fd, core, A64_CPT_SINGLE_CORE_SIZE,
-                       A64_CPT_DEFAULT_HEADER_OFFSET + cpt_offset);
+    write_checkpoint_header(*metadata);
+    write_checkpoint_layout(*metadata);
+    write_core_state(*core, env, pc);
 }
 
 static char *checkpoint_output_path(uint64_t insns)
 {
-    return g_strdup_printf("%s/%" PRIu64 "/_%" PRIu64 "_.bin",
+    return g_strdup_printf("%s/%" PRIu64 "/_%" PRIu64 "_.bin.zst",
                            a64_cpt.output_dir, insns, insns);
 }
+
+#ifdef CONFIG_ZSTD
+static int write_zstd_checkpoint(int fd, CPUARMState *env, uint64_t pc,
+                                 const uint8_t *ram, uint64_t ram_size)
+{
+    g_autofree uint8_t *metadata = NULL;
+    g_autofree uint8_t *core = NULL;
+    g_autofree uint8_t *scratch = g_malloc(A64_CPT_ZSTD_CHUNK_SIZE);
+    ZSTD_CCtx *cctx = NULL;
+    A64CheckpointOverlay overlays[2];
+    size_t metadata_len;
+    size_t core_len;
+    uint64_t overlay_end;
+    size_t zret;
+    int ret = 0;
+
+    build_metadata(env, pc, &metadata, &metadata_len, &core, &core_len);
+    overlays[0] = (A64CheckpointOverlay) {
+        .offset = A64_CPT_DEFAULT_HEADER_OFFSET,
+        .data = metadata,
+        .len = metadata_len,
+    };
+    overlays[1] = (A64CheckpointOverlay) {
+        .offset = A64_CPT_DEFAULT_HEADER_OFFSET + metadata_len,
+        .data = core,
+        .len = core_len,
+    };
+
+    overlay_end = overlays[1].offset + overlays[1].len;
+    if (overlay_end > ram_size) {
+        error_report("a64 checkpoint: RAM size 0x%" PRIx64
+                     " is smaller than checkpoint metadata end 0x%" PRIx64,
+                     ram_size, overlay_end);
+        return -EFBIG;
+    }
+
+    cctx = ZSTD_createCCtx();
+    if (!cctx) {
+        return -ENOMEM;
+    }
+
+    zret = ZSTD_CCtx_setParameter(cctx, ZSTD_c_compressionLevel,
+                                  A64_CPT_ZSTD_LEVEL);
+    if (ZSTD_isError(zret)) {
+        error_report("a64 checkpoint: failed to set zstd level: %s",
+                     ZSTD_getErrorName(zret));
+        ret = -EIO;
+        goto out;
+    }
+
+    for (uint64_t off = 0; off < ram_size; off += A64_CPT_ZSTD_CHUNK_SIZE) {
+        size_t chunk_len = MIN((uint64_t)A64_CPT_ZSTD_CHUNK_SIZE,
+                               ram_size - off);
+        const uint8_t *input = ram + off;
+        bool overlay_hit = false;
+
+        for (size_t i = 0; i < ARRAY_SIZE(overlays); i++) {
+            if (range_overlaps(off, chunk_len,
+                               overlays[i].offset, overlays[i].len)) {
+                overlay_hit = true;
+                break;
+            }
+        }
+
+        if (overlay_hit) {
+            memcpy(scratch, ram + off, chunk_len);
+            apply_overlays(scratch, off, chunk_len,
+                           overlays, ARRAY_SIZE(overlays));
+            input = scratch;
+        }
+
+        ret = zstd_write_input(cctx, fd, input, chunk_len, ZSTD_e_continue);
+        if (ret < 0) {
+            goto out;
+        }
+    }
+
+    ret = zstd_write_input(cctx, fd, "", 0, ZSTD_e_end);
+
+out:
+    ZSTD_freeCCtx(cctx);
+    return ret;
+}
+#endif
 
 static bool dump_checkpoint(CPUARMState *env, uint64_t pc, uint64_t rel_insns)
 {
@@ -589,10 +724,14 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc, uint64_t rel_insns)
         return false;
     }
 
-    ret = write_sparse_ram(fd, ram_ptr, a64_cpt.ram_size);
-    if (ret == 0) {
-        ret = write_metadata(fd, env, pc);
-    }
+#ifndef CONFIG_ZSTD
+    error_report("a64 checkpoint: zstd support is not available; "
+                 "reconfigure QEMU with --enable-zstd");
+    close(fd);
+    unlink(path);
+    return false;
+#else
+    ret = write_zstd_checkpoint(fd, env, pc, ram_ptr, a64_cpt.ram_size);
     if (close(fd) < 0 && ret == 0) {
         ret = -errno;
     }
@@ -603,10 +742,11 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc, uint64_t rel_insns)
         return false;
     }
 
-    info_report("a64 checkpoint: wrote %s at relative instruction %" PRIu64
-                " pc=0x%" PRIx64,
+    info_report("a64 checkpoint: wrote zstd checkpoint %s at relative "
+                "instruction %" PRIu64 " pc=0x%" PRIx64,
                 path, rel_insns, pc);
     return true;
+#endif
 }
 
 void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
