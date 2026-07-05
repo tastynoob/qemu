@@ -84,11 +84,14 @@ typedef uint64_t qemu_plugin_id_t;
  * version 7:
  * - add userdata to all plugin callbacks, allowing maintenance of state
  *   externally, and easing interfacing with other languages.
+ *
+ * version 8:
+ * - added AArch64 simtrap profiling mode control API.
  */
 
 extern QEMU_PLUGIN_EXPORT int qemu_plugin_version;
 
-#define QEMU_PLUGIN_VERSION 7
+#define QEMU_PLUGIN_VERSION 8
 
 /**
  * struct qemu_info_t - system information for plugins
@@ -1291,6 +1294,15 @@ qemu_plugin_write_memory_hwaddr(uint64_t addr, GByteArray *data);
  */
 QEMU_PLUGIN_API
 bool qemu_plugin_translate_vaddr(uint64_t vaddr, uint64_t *hwaddr);
+
+/**
+ * qemu_plugin_a64_simtrap_set_profiling_mode() - control AArch64 simtrap
+ * profiling-mode signal side effects.
+ *
+ * @enabled: true when a plugin is using AArch64 simtrap profiling mode.
+ */
+QEMU_PLUGIN_API
+void qemu_plugin_a64_simtrap_set_profiling_mode(bool enabled);
 
 /**
  * qemu_plugin_scoreboard_new() - alloc a new scoreboard

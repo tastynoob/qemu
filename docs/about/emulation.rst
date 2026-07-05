@@ -332,10 +332,13 @@ is selected for SimPoint analysis.
 
 AArch64 system-mode profiling can use ``HLT #imm16`` as a simtrap signal.
 The signal values match XiangShan's NEMU trap convention:
-``HLT #0x100`` masks PSTATE ``D/A/I/F`` in QEMU, ``HLT #0x101`` marks
-workload loaded, starts profiling, and also masks ``D/A/I/F`` if needed, and
-``HLT #0x102`` marks workload exit, stops profiling, and restores the previous
-DAIF value. The corresponding encodings are ``.inst 0xd4402000``,
+``HLT #0x100`` masks PSTATE ``D/A/I/F`` in QEMU. ``HLT #0x101`` marks
+workload loaded and starts profiling, and ``HLT #0x102`` marks workload exit
+and stops profiling. Outside simpoint profiling, ``HLT #0x101`` and
+``HLT #0x102`` execute as NOPs; ``HLT #0x100`` still masks interrupts. When
+the simpoint plugin uses ``trigger=simtrap``, ``HLT #0x101`` also masks
+``D/A/I/F`` if needed, and ``HLT #0x102`` restores the previous DAIF value.
+The corresponding encodings are ``.inst 0xd4402000``,
 ``.inst 0xd4402020``, and ``.inst 0xd4402040``. The simtrap instructions are
 not counted in the BBV: profiling starts at the instruction after
 ``HLT #0x101`` and ends at the instruction before ``HLT #0x102``.

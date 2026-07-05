@@ -15,9 +15,21 @@
 #define A64_SIMTRAP_PROFILE_START SIMTRAP_NOTIFY_PROFILER
 #define A64_SIMTRAP_PROFILE_STOP  SIMTRAP_NOTIFY_WORKLOAD_EXIT
 
+#define A64_SIMTRAP_IS_PROFILE_SIGNAL(imm) \
+    ((imm) == A64_SIMTRAP_PROFILE_START || \
+     (imm) == A64_SIMTRAP_PROFILE_STOP)
+
 #define A64_SIMTRAP_IS_HANDLED(imm) \
     ((imm) == SIMTRAP_DISABLE_TIME_INTR || \
-     (imm) == A64_SIMTRAP_PROFILE_START || \
-     (imm) == A64_SIMTRAP_PROFILE_STOP)
+     A64_SIMTRAP_IS_PROFILE_SIGNAL(imm))
+
+#ifdef CONFIG_PLUGIN
+bool qemu_plugin_a64_simtrap_in_profiling_mode(void);
+#else
+static inline bool qemu_plugin_a64_simtrap_in_profiling_mode(void)
+{
+    return false;
+}
+#endif
 
 #endif /* TARGET_ARM_SIMTRAP_H */

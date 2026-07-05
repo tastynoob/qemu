@@ -52,7 +52,7 @@ static uint64_t interval = 100000000;
 static uint64_t skip = 0;
 static unsigned int profile_cpu = 0;
 static bool dump_final;
-static bool use_simtrap;
+static bool profiling_mode;
 
 static guint bb_key_hash(gconstpointer data)
 {
@@ -134,11 +134,11 @@ static bool parse_bool(const char *name, const char *value, bool *out)
 static bool parse_trigger(const char *value)
 {
     if (g_strcmp0(value, "immediate") == 0) {
-        use_simtrap = false;
+        profiling_mode = false;
         return true;
     }
     if (g_strcmp0(value, "simtrap") == 0) {
-        use_simtrap = true;
+        profiling_mode = true;
         return true;
     }
 
@@ -290,7 +290,7 @@ static void vcpu_start(unsigned int vcpu_index)
 
 static void vcpu_init(unsigned int vcpu_index, void *userdata)
 {
-    if (!use_simtrap && vcpu_index == profile_cpu && skip == 0) {
+    if (!profiling_mode && vcpu_index == profile_cpu && skip == 0) {
         vcpu_start(vcpu_index);
     }
 }
@@ -354,7 +354,7 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
     uint32_t imm;
     Bb *bb = NULL;
 
-    if (use_simtrap && n_insns > 0) {
+    if (profiling_mode && n_insns > 0) {
         struct qemu_plugin_insn *last =
             qemu_plugin_tb_get_insn(tb, n_insns - 1);
 
@@ -388,7 +388,7 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
             tb, QEMU_PLUGIN_INLINE_ADD_U64, bb_count_u64(bb),
             profile_n_insns);
 
-        if (!use_simtrap && skip > 0) {
+        if (!profiling_mode && skip > 0) {
             qemu_plugin_register_vcpu_tb_exec_cond_cb(
                 tb, vcpu_skip_exec, QEMU_PLUGIN_CB_NO_REGS,
                 QEMU_PLUGIN_COND_GE, total_count_u64(), skip, NULL);
@@ -398,7 +398,7 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
             QEMU_PLUGIN_COND_GE, interval_count_u64(), interval, NULL);
     }
 
-    if (use_simtrap) {
+    if (profiling_mode) {
         for (uint64_t i = 0; i < n_insns; i++) {
             struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
 
@@ -415,6 +415,10 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
 
 static void plugin_exit(void *p)
 {
+    if (profiling_mode) {
+        qemu_plugin_a64_simtrap_set_profiling_mode(false);
+    }
+
     if (dump_final && profile_cpu < qemu_plugin_num_vcpus()) {
         Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, profile_cpu);
 
@@ -481,7 +485,7 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
                 return -1;
             }
         } else if (g_strcmp0(tokens[0], "simtrap") == 0) {
-            if (!parse_bool(tokens[0], tokens[1], &use_simtrap)) {
+            if (!parse_bool(tokens[0], tokens[1], &profiling_mode)) {
                 return -1;
             }
         } else if (g_strcmp0(tokens[0], "target") == 0) {
@@ -526,7 +530,11 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
             "simpoint: output=%s interval=%" PRIu64 " skip=%" PRIu64
             " cpu=%u trigger=%s\n",
             outfile, interval, skip, profile_cpu,
-            use_simtrap ? "simtrap" : "immediate");
+            profiling_mode ? "simtrap" : "immediate");
+
+    if (profiling_mode) {
+        qemu_plugin_a64_simtrap_set_profiling_mode(true);
+    }
 
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);

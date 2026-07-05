@@ -48,7 +48,22 @@
 #include "exec/translation-block.h"
 #include "exec/translator.h"
 #include "disas/disas.h"
+#include "qemu/atomic.h"
 #include "plugin.h"
+
+static bool a64_simtrap_profiling_mode;
+
+bool qemu_plugin_a64_simtrap_in_profiling_mode(void);
+
+void qemu_plugin_a64_simtrap_set_profiling_mode(bool enabled)
+{
+    qatomic_set(&a64_simtrap_profiling_mode, enabled);
+}
+
+bool qemu_plugin_a64_simtrap_in_profiling_mode(void)
+{
+    return qatomic_read(&a64_simtrap_profiling_mode);
+}
 
 /* Uninstall and Reset handlers */
 
@@ -694,4 +709,3 @@ uint64_t qemu_plugin_u64_sum(qemu_plugin_u64 entry)
     }
     return total;
 }
-
