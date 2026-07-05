@@ -34,6 +34,7 @@
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_gcspr[4];
 static TCGv_i64 cpu_pc;
+static TCGv_i64 cpu_profiling_insns;
 
 /* Load/store exclusive handling */
 static TCGv_i64 cpu_exclusive_high;
@@ -93,6 +94,10 @@ void a64_translate_init(void)
     cpu_pc = tcg_global_mem_new_i64(tcg_env,
                                     offsetof(CPUARMState, pc),
                                     "pc");
+    cpu_profiling_insns =
+        tcg_global_mem_new_i64(tcg_env,
+                               offsetof(CPUARMState, profiling_insns),
+                               "profiling_insns");
     for (i = 0; i < 32; i++) {
         cpu_X[i] = tcg_global_mem_new_i64(tcg_env,
                                           offsetof(CPUARMState, xregs[i]),
@@ -11246,6 +11251,7 @@ const TranslatorOps aarch64_translator_ops = {
     .insn_start         = aarch64_tr_insn_start,
     .translate_insn     = aarch64_tr_translate_insn,
     .tb_stop            = aarch64_tr_tb_stop,
+    .cpu_exec_count     = &cpu_profiling_insns,
 };
 
 void aarch64_translate_code(CPUState *cpu, TranslationBlock *tb,

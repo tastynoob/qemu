@@ -295,6 +295,7 @@ typedef struct CPUArchState {
     uint64_t daif; /* exception masks, in the bits they are in PSTATE */
     uint64_t simtrap_saved_daif;
     bool simtrap_daif_masked;
+    uint64_t profiling_insns;
     uint64_t svcr; /* PSTATE.{SM,ZA} in the bits they are in SVCR */
 
     uint64_t elr_el[4]; /* AArch64 exception link regs  */

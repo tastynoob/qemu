@@ -979,6 +979,24 @@ static const VMStateDescription vmstate_fpmr = {
     },
 };
 
+static bool profiling_insns_needed(void *opaque)
+{
+    ARMCPU *cpu = opaque;
+
+    return cpu->env.profiling_insns != 0;
+}
+
+static const VMStateDescription vmstate_profiling_insns = {
+    .name = "cpu/profiling_insns",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = profiling_insns_needed,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT64(env.profiling_insns, ARMCPU),
+        VMSTATE_END_OF_LIST()
+    },
+};
+
 static int cpu_pre_save(void *opaque)
 {
     ARMCPU *cpu = opaque;
@@ -1343,6 +1361,7 @@ const VMStateDescription vmstate_arm_cpu = {
         &vmstate_pstate64,
         &vmstate_event,
         &vmstate_fpmr,
+        &vmstate_profiling_insns,
         NULL
     }
 };

@@ -304,7 +304,9 @@ Example::
 
 The simpoint plugin generates gzip-compressed SimPoint 3.2 basic block vectors.
 It is intended for system-mode profiling where a single vCPU instruction stream
-is selected for SimPoint analysis.
+is selected for SimPoint analysis. Complete intervals are cut at the exact
+configured instruction count; when an interval boundary falls inside a
+translated block, the block's contribution is split across adjacent vectors.
 
 .. list-table:: SimPoint plugin arguments
   :widths: 20 80
@@ -342,6 +344,13 @@ The corresponding encodings are ``.inst 0xd4402000``,
 ``.inst 0xd4402020``, and ``.inst 0xd4402040``. The simtrap instructions are
 not counted in the BBV: profiling starts at the instruction after
 ``HLT #0x101`` and ends at the instruction before ``HLT #0x102``.
+For reproducible full-system profiling runs, use deterministic instruction
+counting such as ``-icount shift=0,sleep=off`` so timer-driven guest state does
+not change the profiled instruction stream between runs.
+AArch64 TCG also maintains an internal ``profiling_insns`` counter in CPU state,
+incremented once per translated guest instruction. This provides the exact
+absolute instruction count used by later SimPoint checkpoint slicing; it is
+independent of the guest-visible generic timer.
 
 Example::
 
