@@ -77,7 +77,9 @@
 #define A64_CPT_OFF_PAUTH_DONE  UINT64_C(0x70050)
 
 typedef struct A64CheckpointPoint {
-    uint64_t insns;
+    uint64_t measure_insns;
+    uint64_t checkpoint_insns;
+    uint64_t warmup_insns;
 } A64CheckpointPoint;
 
 typedef struct A64CheckpointOverlay {
@@ -92,12 +94,14 @@ typedef struct A64CheckpointState {
     bool exit_after_last;
     bool writing;
     uint64_t window_base;
+    uint64_t warmup_interval;
     uint64_t ram_base;
     uint64_t ram_size;
     MemoryRegion *ram;
     char *output_dir;
     GArray *points;
     size_t next_point;
+    uint64_t dropped_points;
 } A64CheckpointState;
 
 static A64CheckpointState a64_cpt;
@@ -122,10 +126,16 @@ static int compare_points(gconstpointer a, gconstpointer b)
     const A64CheckpointPoint *pa = a;
     const A64CheckpointPoint *pb = b;
 
-    if (pa->insns == pb->insns) {
+    if (pa->checkpoint_insns != pb->checkpoint_insns) {
+        return pa->checkpoint_insns < pb->checkpoint_insns ? -1 : 1;
+    }
+    if (pa->measure_insns != pb->measure_insns) {
+        return pa->measure_insns < pb->measure_insns ? -1 : 1;
+    }
+    if (pa->warmup_insns == pb->warmup_insns) {
         return 0;
     }
-    return pa->insns < pb->insns ? -1 : 1;
+    return pa->warmup_insns < pb->warmup_insns ? -1 : 1;
 }
 
 static void clear_points(void)
@@ -137,9 +147,22 @@ static void clear_points(void)
     a64_cpt.next_point = 0;
 }
 
-static void add_point(uint64_t insns)
+static void add_point(uint64_t measure_insns)
 {
-    A64CheckpointPoint point = { .insns = insns };
+    A64CheckpointPoint point = {
+        .measure_insns = measure_insns,
+    };
+
+    if (measure_insns >= a64_cpt.warmup_interval) {
+        point.checkpoint_insns = measure_insns - a64_cpt.warmup_interval;
+        point.warmup_insns = a64_cpt.warmup_interval;
+    } else {
+        a64_cpt.dropped_points++;
+        info_report("a64 checkpoint: dropping measurement point %" PRIu64
+                    " before warmup %" PRIu64,
+                    measure_insns, a64_cpt.warmup_interval);
+        return;
+    }
 
     if (!a64_cpt.points) {
         a64_cpt.points = g_array_new(false, false, sizeof(point));
@@ -150,7 +173,7 @@ static void add_point(uint64_t insns)
 static void sort_and_dedupe_points(void)
 {
     GArray *dedup;
-    uint64_t last = 0;
+    A64CheckpointPoint last = { 0 };
     bool have_last = false;
 
     if (!a64_cpt.points || a64_cpt.points->len == 0) {
@@ -164,11 +187,14 @@ static void sort_and_dedupe_points(void)
         A64CheckpointPoint point =
             g_array_index(a64_cpt.points, A64CheckpointPoint, i);
 
-        if (have_last && point.insns == last) {
+        if (have_last &&
+            point.measure_insns == last.measure_insns &&
+            point.checkpoint_insns == last.checkpoint_insns &&
+            point.warmup_insns == last.warmup_insns) {
             continue;
         }
         g_array_append_val(dedup, point);
-        last = point.insns;
+        last = point;
         have_last = true;
     }
 
@@ -613,10 +639,19 @@ static void build_metadata(CPUARMState *env, uint64_t pc,
     write_core_state(*core, env, pc);
 }
 
-static char *checkpoint_output_path(uint64_t insns)
+static char *checkpoint_output_path(const A64CheckpointPoint *point)
 {
-    return g_strdup_printf("%s/%" PRIu64 "/_%" PRIu64 "_.bin.zst",
-                           a64_cpt.output_dir, insns, insns);
+    if (a64_cpt.warmup_interval == 0) {
+        return g_strdup_printf("%s/%" PRIu64 "/_%" PRIu64 "_.bin.zst",
+                               a64_cpt.output_dir, point->measure_insns,
+                               point->measure_insns);
+    }
+
+    return g_strdup_printf("%s/%" PRIu64 "/_%" PRIu64
+                           "_warmup_%" PRIu64 "_cpt_%" PRIu64 "_.bin.zst",
+                           a64_cpt.output_dir, point->measure_insns,
+                           point->measure_insns, point->warmup_insns,
+                           point->checkpoint_insns);
 }
 
 #ifdef CONFIG_ZSTD
@@ -703,9 +738,10 @@ out:
 }
 #endif
 
-static bool dump_checkpoint(CPUARMState *env, uint64_t pc, uint64_t rel_insns)
+static bool dump_checkpoint(CPUARMState *env, uint64_t pc,
+                            const A64CheckpointPoint *point)
 {
-    g_autofree char *path = checkpoint_output_path(rel_insns);
+    g_autofree char *path = checkpoint_output_path(point);
     g_autofree char *dir = g_path_get_dirname(path);
     uint8_t *ram_ptr = memory_region_get_ram_ptr(a64_cpt.ram);
     int fd;
@@ -743,8 +779,10 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc, uint64_t rel_insns)
     }
 
     info_report("a64 checkpoint: wrote zstd checkpoint %s at relative "
-                "instruction %" PRIu64 " pc=0x%" PRIx64,
-                path, rel_insns, pc);
+                "instruction %" PRIu64 " pc=0x%" PRIx64
+                " measurement=%" PRIu64 " warmup=%" PRIu64,
+                path, point->checkpoint_insns, pc, point->measure_insns,
+                point->warmup_insns);
     return true;
 #endif
 }
@@ -757,6 +795,7 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
                               const char *simpoint_path,
                               const char *simpoint_file,
                               uint64_t cpt_interval,
+                              uint64_t warmup_interval,
                               bool exit_after_last,
                               Error **errp)
 {
@@ -783,10 +822,12 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
     a64_cpt.ram = ram;
     a64_cpt.ram_base = ram_base;
     a64_cpt.ram_size = ram_size;
+    a64_cpt.warmup_interval = warmup_interval;
     a64_cpt.exit_after_last = exit_after_last;
     a64_cpt.window_started = false;
     a64_cpt.window_base = 0;
     a64_cpt.writing = false;
+    a64_cpt.dropped_points = 0;
 
     if (!parse_cutpoints_string(cutpoints, errp) ||
         !parse_cutpoints_file(cutpoints_file, false, cpt_interval, errp) ||
@@ -804,8 +845,10 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
     }
 
     a64_cpt.enabled = true;
-    info_report("a64 checkpoint: enabled with %u cutpoint(s), output '%s'",
-                a64_cpt.points->len, a64_cpt.output_dir);
+    info_report("a64 checkpoint: enabled with %u cutpoint(s), output '%s', "
+                "warmup %" PRIu64 ", dropped %" PRIu64,
+                a64_cpt.points->len, a64_cpt.output_dir,
+                a64_cpt.warmup_interval, a64_cpt.dropped_points);
 }
 
 bool a64_checkpoint_is_enabled(void)
@@ -840,7 +883,6 @@ void a64_checkpoint_notify_profiler(CPUARMState *env, bool start)
 void a64_checkpoint_try_take(CPUARMState *env, uint64_t pc)
 {
     uint64_t rel_insns;
-    A64CheckpointPoint *point;
 
     if (!a64_checkpoint_has_pending() || !a64_cpt.window_started ||
         a64_cpt.writing || env->profiling_insns < a64_cpt.window_base) {
@@ -848,15 +890,20 @@ void a64_checkpoint_try_take(CPUARMState *env, uint64_t pc)
     }
 
     rel_insns = env->profiling_insns - a64_cpt.window_base;
-    point = &g_array_index(a64_cpt.points, A64CheckpointPoint,
-                           a64_cpt.next_point);
-    if (rel_insns < point->insns) {
-        return;
-    }
-
     a64_cpt.writing = true;
-    if (dump_checkpoint(env, pc, point->insns)) {
-        a64_cpt.next_point++;
+    while (a64_checkpoint_has_pending()) {
+        A64CheckpointPoint *point =
+            &g_array_index(a64_cpt.points, A64CheckpointPoint,
+                           a64_cpt.next_point);
+
+        if (rel_insns < point->checkpoint_insns) {
+            break;
+        }
+        if (dump_checkpoint(env, pc, point)) {
+            a64_cpt.next_point++;
+        } else {
+            break;
+        }
     }
     a64_cpt.writing = false;
 

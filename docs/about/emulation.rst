@@ -333,6 +333,10 @@ translated block, the block's contribution is split across adjacent vectors.
       The default is ``immediate``. ``simtrap=true|false`` is also accepted.
 
 AArch64 system-mode profiling can use ``HLT #imm16`` as a simtrap signal.
+This plugin option is a profiling-time BBV skip, not the per-slice checkpoint
+warmup used before performance measurement. For AArch64 ``mini-virt``
+checkpoints, use the machine option ``warmup-interval=N`` so the snapshot is
+taken before the SimPoint measurement point.
 The signal values match XiangShan's NEMU trap convention:
 ``HLT #0x100`` masks PSTATE ``D/A/I/F`` in QEMU. ``HLT #0x101`` marks
 workload loaded and starts profiling, and ``HLT #0x102`` marks workload exit

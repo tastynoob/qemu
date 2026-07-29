@@ -22,6 +22,7 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
                               const char *simpoint_path,
                               const char *simpoint_file,
                               uint64_t cpt_interval,
+                              uint64_t warmup_interval,
                               bool exit_after_last,
                               Error **errp);
 bool a64_checkpoint_is_enabled(void);

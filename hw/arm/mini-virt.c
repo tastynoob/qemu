@@ -57,6 +57,7 @@ typedef struct MiniVirtMachineState {
     char *simpoint_path;
     char *simpoint_file;
     uint64_t cpt_interval;
+    uint64_t warmup_interval;
     bool checkpoint_exit_after_last;
 } MiniVirtMachineState;
 
@@ -247,6 +248,7 @@ static void mini_virt_init(MachineState *machine)
                              mms->checkpoint_dir, mms->cutpoints,
                              mms->cutpoints_file, mms->simpoint_path,
                              mms->simpoint_file, mms->cpt_interval,
+                             mms->warmup_interval,
                              mms->checkpoint_exit_after_last, &local_err);
     if (local_err) {
         error_reportf_err(local_err, "mini-virt checkpoint setup failed: ");
@@ -363,6 +365,21 @@ static void mini_virt_set_cpt_interval(Object *obj, const char *value,
     mms->cpt_interval = interval;
 }
 
+static void mini_virt_set_warmup_interval(Object *obj, const char *value,
+                                          Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+    const char *endp = NULL;
+    uint64_t interval;
+
+    if (qemu_strtou64(value, &endp, 0, &interval) < 0 ||
+        (endp && *endp != '\0')) {
+        error_setg(errp, "invalid warmup-interval '%s'", value);
+        return;
+    }
+    mms->warmup_interval = interval;
+}
+
 static void mini_virt_get_checkpoint_exit_after_last(Object *obj, Visitor *v,
                                                      const char *name,
                                                      void *opaque,
@@ -435,6 +452,8 @@ static void mini_virt_machine_init(MachineClass *mc)
                                   mini_virt_set_simpoint_file);
     object_class_property_add_str(oc, "cpt-interval", NULL,
                                   mini_virt_set_cpt_interval);
+    object_class_property_add_str(oc, "warmup-interval", NULL,
+                                  mini_virt_set_warmup_interval);
     object_class_property_add(oc, "checkpoint-exit-after-last", "bool",
                               mini_virt_get_checkpoint_exit_after_last,
                               mini_virt_set_checkpoint_exit_after_last,

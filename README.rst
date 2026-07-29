@@ -56,7 +56,7 @@ AArch64 使用 ``HLT #imm`` 作为 sim trap 伪指令。signal 编码与 XiangSh
 
 * ``PROFILE_START`` 执行完成后的下一条 guest 指令开始计数和记录。
 * ``PROFILE_STOP`` 以前一条 guest 指令作为结束，stop trap 自身不计入 BBV。
-* checkpoint 切点 ``N`` 表示 profiling window 内已经执行 ``N`` 条指令后的状态；恢复后 PC 指向第 ``N + 1`` 条将执行的指令。
+* checkpoint 输入切点 ``N`` 表示 profiling window 内的计性能起点。默认 ``warmup-interval=0`` 时，snapshot 就打在 ``N``；如果设置了 warmup，则 snapshot 打在 ``N - warmup-interval``，恢复后先执行恒定 warmup 段，再进入计性能区间。若 ``N < warmup-interval``，该切点会被丢弃，不会为单个 slice 自动缩短 warmup。
 * profiling/checkpoint 采集运行中，``PROFILE_START`` 会关闭中断。
 * checkpoint restore 运行中，关中断由 gcpt restorer 负责，不依赖 QEMU 再处理 profiling sim trap。
 * 非 profiling/checkpoint 模式下，``0x101`` 和 ``0x102`` 被当作 nop；``0x100`` 仍会关闭中断。
@@ -153,7 +153,7 @@ SimPoint cluster 切点命令模板：
 
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
-    -machine mini-virt,checkpoint-mode=SimpointCheckpoint,simpoint-path=<simpoint-dir>,cpt-interval=<interval>,checkpoint-dir=<checkpoint-dir> \
+    -machine mini-virt,checkpoint-mode=SimpointCheckpoint,simpoint-path=<simpoint-dir>,cpt-interval=<interval>,warmup-interval=<warmup>,checkpoint-dir=<checkpoint-dir> \
     -cpu cortex-a57 \
     -smp 1 \
     -m <memory-size> \
@@ -169,19 +169,22 @@ SimPoint cluster 切点命令模板：
   checkpoint 输出根目录。默认值为 ``a64-checkpoints``。
 
 ``cutpoints=<cutpoint-list>``
-  直接指定 profiling window 内的相对指令切点。可以用逗号、分号、冒号或空白分隔。
+  直接指定 profiling window 内的计性能起点。可以用逗号、分号、冒号或空白分隔。
 
 ``cutpoints-file=<file>``
-  从文件读取切点。每行第一个整数作为相对指令切点；空行和 ``#`` 注释行会忽略。
+  从文件读取计性能起点。每行第一个整数作为相对指令数；空行和 ``#`` 注释行会忽略。
 
 ``simpoint-file=<file>``
-  读取 SimPoint ``simpoints0`` 风格文件。每行第一个整数是 simpoint location，实际切点为 ``location * cpt-interval``。不会跳过任何 location，包括 ``0``。
+  读取 SimPoint ``simpoints0`` 风格文件。每行第一个整数是 simpoint location，计性能起点为 ``location * cpt-interval``。不会跳过任何 location，包括 ``0``。
 
 ``simpoint-path=<path>``
   如果是目录，则读取 ``<path>/simpoints0``；如果是文件，则按 ``simpoint-file`` 处理。
 
 ``cpt-interval=<interval>``
   profiling 时使用的 SimPoint interval。使用 ``simpoint-file`` 或 ``simpoint-path`` 时必须设置。
+
+``warmup-interval=<warmup>``
+  每个 slice 的 warmup 指令数，默认 ``0``。实际 snapshot 位置为 ``measurement-point - warmup``。如果 measurement point 小于 warmup，该 slice 会被丢弃，以保证所有生成的 slice 使用恒定 warmup；不会把 snapshot 位置钳到 ``0`` 后生成短 warmup checkpoint。
 
 ``checkpoint-exit-after-last=<bool>``
   生成最后一个 checkpoint 后是否退出 QEMU。默认 ``true``。
@@ -190,9 +193,15 @@ SimPoint cluster 切点命令模板：
 
 .. code-block:: text
 
-  <checkpoint-dir>/<cutpoint>/_<cutpoint>_.bin.zst
+  <checkpoint-dir>/<measurement-point>/_<measurement-point>_.bin.zst
 
-其中 ``<cutpoint>`` 是 profiling window 内的相对指令数，而不是从 reset 开始的全局指令数。
+如果设置了 ``warmup-interval``，文件名会额外包含 warmup 和 snapshot 位置：
+
+.. code-block:: text
+
+  <checkpoint-dir>/<measurement-point>/_<measurement-point>_warmup_<warmup>_cpt_<checkpoint-point>_.bin.zst
+
+其中 ``<measurement-point>`` 和 ``<checkpoint-point>`` 都是 profiling window 内的相对指令数，而不是从 reset 开始的全局指令数。生成的 checkpoint 都满足 ``measurement-point - checkpoint-point == warmup``。
 
 snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM image：
 
@@ -220,7 +229,7 @@ snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM im
 恢复 checkpoint
 ===============
 
-恢复时直接把生成的 ``_<cutpoint>_.bin.zst`` 当作 ``mini-virt`` payload 启动，不要再开启 ``checkpoint-mode``。``mini-virt`` 会在加载时流式解压 ``.zst``：
+恢复时直接把生成的 checkpoint ``.bin.zst`` 当作 ``mini-virt`` payload 启动，不要再开启 ``checkpoint-mode``。``mini-virt`` 会在加载时流式解压 ``.zst``：
 
 .. code-block:: shell
 
@@ -271,5 +280,5 @@ snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM im
 1. 构建 QEMU 和插件。
 2. 使用 ``libsimpoint.so,trigger=simtrap`` 运行 workload，得到 ``simpoint_bbv.gz``。
 3. 使用 SimPoint 3.2 对 BBV 做 cluster，得到 ``simpoints0``。
-4. 使用 ``checkpoint-mode=SimpointCheckpoint,simpoint-path=<path>,cpt-interval=<interval>`` 生成 checkpoints。
-5. 直接启动 ``_<cutpoint>_.bin.zst`` 做恢复验证和后续 CPU 性能测试。
+4. 使用 ``checkpoint-mode=SimpointCheckpoint,simpoint-path=<path>,cpt-interval=<interval>,warmup-interval=<warmup>`` 生成 checkpoints；不需要 warmup 时可省略 ``warmup-interval``。
+5. 直接启动生成的 checkpoint ``.bin.zst`` 做恢复验证和后续 CPU 性能测试。
