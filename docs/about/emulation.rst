@@ -304,9 +304,20 @@ Example::
 
 The simpoint plugin generates gzip-compressed SimPoint 3.2 basic block vectors.
 It is intended for system-mode profiling where a single vCPU instruction stream
-is selected for SimPoint analysis. Complete intervals are cut at the exact
-configured instruction count; when an interval boundary falls inside a
-translated block, the block's contribution is split across adjacent vectors.
+is selected for SimPoint analysis. A QEMU translated block is treated as one
+basic block. An interval is emitted at the first translated-block boundary
+where its accumulated instruction count reaches or exceeds the configured
+target. A block is never split across vectors, so an interval may include a
+small translated-block overshoot. That overshoot is carried into the next
+interval threshold, matching NEMU's interval-drift accounting, so boundaries
+remain close to ``location * interval`` instead of accumulating drift. An
+individual vector can therefore be slightly longer or shorter than the target.
+Accounting is deferred until the next translated block, an execution
+discontinuity, or the stop simtrap. On AArch64, the plugin uses the target's
+instruction counter delta to settle only the executed portion of a block, so a
+synchronous exception or memory fault cannot pre-account the unexecuted tail.
+Interval decisions remain at translated-block boundaries; simtrap instructions
+retain dedicated callbacks to define the profiling window exactly.
 
 .. list-table:: SimPoint plugin arguments
   :widths: 20 80
@@ -315,8 +326,10 @@ translated block, the block's contribution is split across adjacent vectors.
   * - Option
     - Description
   * - interval=N
-    - The interval to generate a basic block vector specified by the number of
-      instructions. ``intervals=N`` is also accepted for compatibility.
+    - The target interval length in instructions. The vector closes at the
+      first translated-block boundary at or after the cumulative target, with
+      the boundary drift carried into the next vector. ``intervals=N`` is also
+      accepted for compatibility.
   * - target=DIR
     - Create ``DIR`` and write ``DIR/simpoint_bbv.gz``.
   * - outfile=PATH
@@ -324,10 +337,13 @@ translated block, the block's contribution is split across adjacent vectors.
   * - cpu=N
     - Profile vCPU ``N``. The default is ``0``.
   * - skip=N
-    - Skip the first ``N`` instructions on the profiled vCPU before emitting
-      vectors. ``warmup=N`` is also accepted.
+    - Skip through the first translated-block boundary at or after ``N``
+      instructions on the profiled vCPU before emitting vectors. ``warmup=N``
+      is also accepted.
   * - dump-final=true|false
-    - Emit the final partial interval on exit. The default is ``false``.
+    - Emit the final partial interval on exit. The default is ``false``. Keep
+      it disabled for SimPoint clustering because SimPoint otherwise treats
+      the partial vector as an equal-weight interval.
   * - trigger=immediate|simtrap
     - Start profiling immediately, or wait for AArch64 simtrap instructions.
       The default is ``immediate``. ``simtrap=true|false`` is also accepted.
@@ -336,14 +352,20 @@ AArch64 system-mode profiling can use ``HLT #imm16`` as a simtrap signal.
 This plugin option is a profiling-time BBV skip, not the per-slice checkpoint
 warmup used before performance measurement. For AArch64 ``mini-virt``
 checkpoints, use the machine option ``warmup-interval=N`` so the snapshot is
-taken before the SimPoint measurement point.
+requested before the SimPoint measurement point. The actual snapshot is taken
+at the first checkpoint boundary at or after that requested point. Checkpoint
+boundaries are translated-block entries plus a final check before a stop
+simtrap closes the profiling window. If that boundary is already after the
+measurement point, QEMU skips the slice instead of writing a checkpoint that
+would resume from inside the measurement interval.
 The signal values match XiangShan's NEMU trap convention:
 ``HLT #0x100`` masks PSTATE ``D/A/I/F`` in QEMU. ``HLT #0x101`` marks
 workload loaded and starts profiling, and ``HLT #0x102`` marks workload exit
 and stops profiling. Outside simpoint profiling, ``HLT #0x101`` and
 ``HLT #0x102`` execute as NOPs; ``HLT #0x100`` still masks interrupts. When
 the simpoint plugin uses ``trigger=simtrap``, ``HLT #0x101`` also masks
-``D/A/I/F`` if needed, and ``HLT #0x102`` restores the previous DAIF value.
+``D/A/I/F`` if needed, and ``HLT #0x102`` restores the previous DAIF value and
+requests QEMU shutdown.
 The corresponding encodings are ``.inst 0xd4402000``,
 ``.inst 0xd4402020``, and ``.inst 0xd4402040``. The simtrap instructions are
 not counted in the BBV: profiling starts at the instruction after

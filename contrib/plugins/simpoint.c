@@ -26,8 +26,14 @@ typedef struct Bb {
 
 typedef struct Vcpu {
     uint64_t total_count;
+    /* Includes residual TB overshoot carried from the previous vector. */
     uint64_t interval_count;
+    uint64_t vector_count;
     uint64_t profile_count;
+    Bb *pending_bb;
+    uint64_t pending_insns;
+    uint64_t pending_start_count;
+    bool pending_count_valid;
     bool started;
 } Vcpu;
 
@@ -78,21 +84,6 @@ static void free_bb(void *data)
 
     qemu_plugin_scoreboard_free(bb->count);
     g_free(bb);
-}
-
-static qemu_plugin_u64 total_count_u64(void)
-{
-    return qemu_plugin_scoreboard_u64_in_struct(vcpus, Vcpu, total_count);
-}
-
-static qemu_plugin_u64 interval_count_u64(void)
-{
-    return qemu_plugin_scoreboard_u64_in_struct(vcpus, Vcpu, interval_count);
-}
-
-static qemu_plugin_u64 profile_count_u64(void)
-{
-    return qemu_plugin_scoreboard_u64_in_struct(vcpus, Vcpu, profile_count);
 }
 
 static qemu_plugin_u64 bb_count_u64(Bb *bb)
@@ -201,14 +192,20 @@ static void clear_bb_counts(unsigned int vcpu_index)
     g_rw_lock_reader_unlock(&bbs_lock);
 }
 
-static void write_bbv_interval(unsigned int vcpu_index)
+static void write_bbv_interval(unsigned int vcpu_index, bool complete)
 {
     Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
 
     if (!vcpu->started || !bbv_file) {
         return;
     }
-    vcpu->interval_count = 0;
+    if (complete) {
+        g_assert(vcpu->interval_count >= interval);
+        vcpu->interval_count -= interval;
+    } else {
+        vcpu->interval_count = 0;
+    }
+    vcpu->vector_count = 0;
 
     g_mutex_lock(&file_lock);
     gzputc(bbv_file, 'T');
@@ -228,6 +225,61 @@ static void write_bbv_interval(unsigned int vcpu_index)
     gzputc(bbv_file, '\n');
     gzflush(bbv_file, Z_SYNC_FLUSH);
     g_mutex_unlock(&file_lock);
+}
+
+static void account_pending_bb(unsigned int vcpu_index, uint64_t n_insns)
+{
+    Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+    Bb *bb = vcpu->pending_bb;
+
+    if (!bb) {
+        return;
+    }
+    n_insns = MIN(n_insns, vcpu->pending_insns);
+    vcpu->pending_bb = NULL;
+    vcpu->pending_insns = 0;
+    vcpu->pending_count_valid = false;
+    vcpu->total_count += n_insns;
+
+    if (!vcpu->started || n_insns == 0) {
+        return;
+    }
+
+    vcpu->interval_count += n_insns;
+    vcpu->vector_count += n_insns;
+    vcpu->profile_count += n_insns;
+    qemu_plugin_u64_set(
+        bb_count_u64(bb), vcpu_index,
+        qemu_plugin_u64_get(bb_count_u64(bb), vcpu_index) + n_insns);
+
+    if (vcpu->interval_count >= interval) {
+        write_bbv_interval(vcpu_index, true);
+    }
+}
+
+static void account_pending_bb_full(unsigned int vcpu_index)
+{
+    Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+
+    account_pending_bb(vcpu_index, vcpu->pending_insns);
+}
+
+static void account_pending_bb_exact(unsigned int vcpu_index)
+{
+    Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+    uint64_t current_count;
+
+    if (!vcpu->pending_bb) {
+        return;
+    }
+    if (vcpu->pending_count_valid &&
+        qemu_plugin_read_exec_count(&current_count) &&
+        current_count >= vcpu->pending_start_count) {
+        account_pending_bb(vcpu_index,
+                           current_count - vcpu->pending_start_count);
+    } else {
+        account_pending_bb_full(vcpu_index);
+    }
 }
 
 static bool a64_hlt_imm(uint32_t opcode, uint32_t *imm)
@@ -268,12 +320,14 @@ static void vcpu_stop(unsigned int vcpu_index)
         return;
     }
 
-    if (dump_final && vcpu->interval_count > 0) {
-        write_bbv_interval(vcpu_index);
+    account_pending_bb_exact(vcpu_index);
+
+    if (dump_final && vcpu->vector_count > 0) {
+        write_bbv_interval(vcpu_index, false);
     } else {
         clear_bb_counts(vcpu_index);
-        qemu_plugin_u64_set(interval_count_u64(), vcpu_index, 0);
         vcpu->interval_count = 0;
+        vcpu->vector_count = 0;
     }
     vcpu->started = false;
     fprintf(stderr,
@@ -291,10 +345,12 @@ static void vcpu_start(unsigned int vcpu_index)
     }
 
     clear_bb_counts(vcpu_index);
-    qemu_plugin_u64_set(interval_count_u64(), vcpu_index, 0);
-    qemu_plugin_u64_set(profile_count_u64(), vcpu_index, 0);
     vcpu->interval_count = 0;
+    vcpu->vector_count = 0;
     vcpu->profile_count = 0;
+    vcpu->pending_bb = NULL;
+    vcpu->pending_insns = 0;
+    vcpu->pending_count_valid = false;
     vcpu->started = true;
     fprintf(stderr, "simpoint: vcpu %u profiling started\n", vcpu_index);
 }
@@ -306,8 +362,9 @@ static void vcpu_init(unsigned int vcpu_index, void *userdata)
     }
 }
 
-static void vcpu_skip_exec(unsigned int vcpu_index, void *userdata)
+static void vcpu_tb_exec(unsigned int vcpu_index, void *userdata)
 {
+    Bb *bb = userdata;
     Vcpu *vcpu;
 
     if (vcpu_index != profile_cpu) {
@@ -315,26 +372,35 @@ static void vcpu_skip_exec(unsigned int vcpu_index, void *userdata)
     }
 
     vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
-    if (!vcpu->started && vcpu->total_count >= skip) {
-        vcpu_start(vcpu_index);
+    account_pending_bb_exact(vcpu_index);
+
+    if (!vcpu->started) {
+        if (!profiling_mode && skip > 0 && vcpu->total_count >= skip) {
+            vcpu_start(vcpu_index);
+        }
     }
+
+    vcpu->pending_bb = bb;
+    vcpu->pending_insns = bb->key.n_insns;
+    vcpu->pending_count_valid =
+        qemu_plugin_read_exec_count(&vcpu->pending_start_count);
 }
 
-static void vcpu_interval_exec(unsigned int vcpu_index, void *userdata)
+static void vcpu_discon(unsigned int vcpu_index,
+                        enum qemu_plugin_discon_type type,
+                        uint64_t from_pc, uint64_t to_pc, void *userdata)
 {
     Vcpu *vcpu;
-
     if (vcpu_index != profile_cpu) {
         return;
     }
 
     vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
-    if (!vcpu->started) {
-        qemu_plugin_u64_set(interval_count_u64(), vcpu_index, 0);
-        vcpu->interval_count = 0;
-    } else if (vcpu->interval_count >= interval) {
-        write_bbv_interval(vcpu_index);
+    if (!vcpu->pending_bb) {
+        return;
     }
+
+    account_pending_bb_exact(vcpu_index);
 }
 
 static void vcpu_simtrap_exec(unsigned int vcpu_index, void *userdata)
@@ -389,32 +455,8 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
         }
         g_rw_lock_writer_unlock(&bbs_lock);
 
-        qemu_plugin_u64 total_count = total_count_u64();
-        qemu_plugin_u64 interval_count = interval_count_u64();
-        qemu_plugin_u64 profile_count = profile_count_u64();
-        qemu_plugin_u64 bb_count = bb_count_u64(bb);
-
-        for (uint64_t i = 0; i < profile_n_insns; i++) {
-            struct qemu_plugin_insn *insn = qemu_plugin_tb_get_insn(tb, i);
-
-            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, total_count, 1);
-            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, interval_count, 1);
-            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, profile_count, 1);
-            qemu_plugin_register_vcpu_insn_exec_inline_per_vcpu(
-                insn, QEMU_PLUGIN_INLINE_ADD_U64, bb_count, 1);
-
-            if (!profiling_mode && skip > 0) {
-                qemu_plugin_register_vcpu_insn_exec_cond_cb(
-                    insn, vcpu_skip_exec, QEMU_PLUGIN_CB_NO_REGS,
-                    QEMU_PLUGIN_COND_GE, total_count, skip, NULL);
-            }
-            qemu_plugin_register_vcpu_insn_exec_cond_cb(
-                insn, vcpu_interval_exec, QEMU_PLUGIN_CB_NO_REGS,
-                QEMU_PLUGIN_COND_GE, interval_count, interval, NULL);
-        }
+        qemu_plugin_register_vcpu_tb_exec_cb(
+            tb, vcpu_tb_exec, QEMU_PLUGIN_CB_NO_REGS, bb);
     }
 
     if (profiling_mode) {
@@ -438,11 +480,12 @@ static void plugin_exit(void *p)
         qemu_plugin_a64_simtrap_set_profiling_mode(false);
     }
 
-    if (dump_final && profile_cpu < qemu_plugin_num_vcpus()) {
+    if (profile_cpu < qemu_plugin_num_vcpus()) {
         Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, profile_cpu);
 
-        if (vcpu->started && vcpu->interval_count > 0) {
-            write_bbv_interval(profile_cpu);
+        account_pending_bb_full(profile_cpu);
+        if (dump_final && vcpu->started && vcpu->vector_count > 0) {
+            write_bbv_interval(profile_cpu, false);
         }
     }
 
@@ -557,6 +600,8 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
 
     qemu_plugin_register_atexit_cb(id, plugin_exit, NULL);
     qemu_plugin_register_vcpu_init_cb(id, vcpu_init, NULL);
+    qemu_plugin_register_vcpu_discon_cb(id, QEMU_PLUGIN_DISCON_ALL,
+                                        vcpu_discon, NULL);
     qemu_plugin_register_vcpu_tb_trans_cb(id, vcpu_tb_trans, NULL);
 
     return 0;

@@ -55,8 +55,8 @@ AArch64 使用 ``HLT #imm`` 作为 sim trap 伪指令。signal 编码与 XiangSh
 边界语义：
 
 * ``PROFILE_START`` 执行完成后的下一条 guest 指令开始计数和记录。
-* ``PROFILE_STOP`` 以前一条 guest 指令作为结束，stop trap 自身不计入 BBV。
-* checkpoint 输入切点 ``N`` 表示 profiling window 内的计性能起点。默认 ``warmup-interval=0`` 时，snapshot 就打在 ``N``；如果设置了 warmup，则 snapshot 打在 ``N - warmup-interval``，恢复后先执行恒定 warmup 段，再进入计性能区间。若 ``N < warmup-interval``，该切点会被丢弃，不会为单个 slice 自动缩短 warmup。
+* ``PROFILE_STOP`` 以前一条 guest 指令作为结束，stop trap 自身不计入 BBV；profiling/checkpoint 采集模式下，执行到该 trap 会请求 QEMU 退出。
+* checkpoint 输入切点 ``N`` 表示 profiling window 内的计性能起点。默认 ``warmup-interval=0`` 时，请求 snapshot 位置为 ``N``；如果设置了 warmup，则请求 snapshot 位置为 ``N - warmup-interval``，实际 snapshot 在不早于该请求位置的第一个 checkpoint 检查边界生成。常规检查边界是 TB 入口，``PROFILE_STOP`` 关闭 window 前也会补查一次。恢复后先执行 warmup 段，再进入计性能区间；TB 边界越过会让实际 warmup 略短。如果实际检查边界已经越过 ``N``，该 slice 会被跳过，避免从计性能区间内部恢复。若 ``N < warmup-interval``，该切点会被丢弃，不会为单个 slice 自动缩短 warmup。
 * profiling/checkpoint 采集运行中，``PROFILE_START`` 会关闭中断。
 * checkpoint restore 运行中，关中断由 gcpt restorer 负责，不依赖 QEMU 再处理 profiling sim trap。
 * 非 profiling/checkpoint 模式下，``0x101`` 和 ``0x102`` 被当作 nop；``0x100`` 仍会关闭中断。
@@ -79,8 +79,7 @@ profiling 通过 ``libsimpoint.so`` 插件生成 gzip 压缩的 SimPoint 3.2 BBV
     -m <memory-size> \
     -nographic \
     -kernel <payload.bin> \
-    -plugin build/contrib/plugins/libsimpoint.so,trigger=simtrap,interval=<interval>,target=<profile-dir>,dump-final=true \
-    -plugin build/contrib/plugins/libstoptrigger.so,icount=<max-instructions>:0
+    -plugin build/contrib/plugins/libsimpoint.so,trigger=simtrap,interval=<interval>,target=<profile-dir>,dump-final=false
 
 常用参数：
 
@@ -88,7 +87,7 @@ profiling 通过 ``libsimpoint.so`` 插件生成 gzip 压缩的 SimPoint 3.2 BBV
   由 workload 中的 ``PROFILE_START`` 和 ``PROFILE_STOP`` 控制 profiling window。
 
 ``interval=<interval>``
-  BBV interval，以 guest 指令数计。后续 checkpoint 使用 SimPoint location 时，需要用同一个 interval 计算实际切点。
+  BBV interval 的目标长度，以 guest 指令数计。插件把一个 QEMU TB 作为一个 basic block；累计指令数达到 interval 后，在该 TB 结束边界输出 vector，不会把同一个 TB 拆到相邻 vector。跨界 TB 产生的 drift 会带入下一段的阈值计算，所以单个 vector 可能略长或略短，但第 ``k`` 个累计边界始终位于 ``k * interval`` 之后的首个 TB 边界附近，不会累计偏移。后续 checkpoint 使用 SimPoint location 时，需要用同一个 interval 按 ``location * interval`` 计算请求切点。
 
 ``target=<profile-dir>``
   profiling 输出目录。插件会写入 ``<profile-dir>/simpoint_bbv.gz``。
@@ -99,11 +98,10 @@ profiling 通过 ``libsimpoint.so`` 插件生成 gzip 压缩的 SimPoint 3.2 BBV
 ``cpu=<id>``
   选择采样 vCPU。当前 ``mini-virt`` 只支持单核，通常使用默认值 ``0``。
 
-``dump-final=true``
-  profiling stop 时，如果最后一个 interval 不满，也输出最后一段 BBV。
-
-``libstoptrigger.so``
-  给 QEMU 设置指令数退出条件，避免 workload 结束后停在等待循环而不退出。
+``dump-final=true|false``
+  profiling stop 时是否输出最后一个不满 interval 的 BBV，默认 ``false``。用于
+  SimPoint 聚类时应保持 ``false``，避免把残缺尾段当作一个等权完整区间；由脚本校验并记录
+  未输出的尾段指令数。
 
 产出文件：
 
@@ -117,7 +115,7 @@ BBV 内容是 SimPoint 3.2 文本格式，gzip 压缩。每行表示一个 inter
 
   T:<bb-id>:<instruction-count> :<bb-id>:<instruction-count> ...
 
-其中 ``bb-id`` 由插件按翻译到的 basic block 分配，``instruction-count`` 是该 basic block 在当前 interval 内贡献的指令数。
+其中 ``bb-id`` 由插件按翻译到的 QEMU TB 分配，``instruction-count`` 是该 basic block 在当前 interval 内贡献的指令数。profiling 统计和 interval 判断都在 TB 边界进行；插件在下一 TB、执行流中断或 stop simtrap 处按 AArch64 内部指令计数结算上一 TB，因此同步异常或访存 fault 导致的 TB 提前退出不会预记尚未执行的后半段。simtrap 仍在伪指令执行处单独处理，以精确定义 profiling window 的开始和结束。
 
 后续使用 SimPoint 3.2 对 ``simpoint_bbv.gz`` 做 cluster，通常会得到：
 
@@ -184,7 +182,7 @@ SimPoint cluster 切点命令模板：
   profiling 时使用的 SimPoint interval。使用 ``simpoint-file`` 或 ``simpoint-path`` 时必须设置。
 
 ``warmup-interval=<warmup>``
-  每个 slice 的 warmup 指令数，默认 ``0``。实际 snapshot 位置为 ``measurement-point - warmup``。如果 measurement point 小于 warmup，该 slice 会被丢弃，以保证所有生成的 slice 使用恒定 warmup；不会把 snapshot 位置钳到 ``0`` 后生成短 warmup checkpoint。
+  每个 slice 的 warmup 指令数，默认 ``0``。请求 snapshot 位置为 ``measurement-point - warmup``，实际 snapshot 在不早于该请求位置的第一个 checkpoint 检查边界生成。如果 measurement point 小于 warmup，该 slice 会被丢弃，以保证所有生成的 slice 至少有可请求的恒定 warmup；不会把 snapshot 位置钳到 ``0`` 后生成短 warmup checkpoint。如果 TB 边界越过了 measurement point，也会跳过该 slice，因为这种 checkpoint 已经无法提供正确的 warmup/measurement 区间。
 
 ``checkpoint-exit-after-last=<bool>``
   生成最后一个 checkpoint 后是否退出 QEMU。默认 ``true``。
@@ -195,13 +193,13 @@ SimPoint cluster 切点命令模板：
 
   <checkpoint-dir>/<measurement-point>/_<measurement-point>_.bin.zst
 
-如果设置了 ``warmup-interval``，文件名会额外包含 warmup 和 snapshot 位置：
+如果设置了 ``warmup-interval``，文件名会额外包含 warmup 和请求 snapshot 位置：
 
 .. code-block:: text
 
-  <checkpoint-dir>/<measurement-point>/_<measurement-point>_warmup_<warmup>_cpt_<checkpoint-point>_.bin.zst
+  <checkpoint-dir>/<measurement-point>/_<measurement-point>_warmup_<warmup>_cpt_<requested-checkpoint-point>_.bin.zst
 
-其中 ``<measurement-point>`` 和 ``<checkpoint-point>`` 都是 profiling window 内的相对指令数，而不是从 reset 开始的全局指令数。生成的 checkpoint 都满足 ``measurement-point - checkpoint-point == warmup``。
+其中 ``<measurement-point>`` 和 ``<requested-checkpoint-point>`` 都是 profiling window 内的相对指令数，而不是从 reset 开始的全局指令数。请求位置满足 ``measurement-point - requested-checkpoint-point == warmup``；生成日志会打印实际 snapshot 位置和相对请求位置的 ``overshoot``。若 ``actual snapshot > measurement-point``，QEMU 不会写出该 checkpoint，而是记录 skip 日志。
 
 snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM image：
 
@@ -282,3 +280,13 @@ snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM im
 3. 使用 SimPoint 3.2 对 BBV 做 cluster，得到 ``simpoints0``。
 4. 使用 ``checkpoint-mode=SimpointCheckpoint,simpoint-path=<path>,cpt-interval=<interval>,warmup-interval=<warmup>`` 生成 checkpoints；不需要 warmup 时可省略 ``warmup-interval``。
 5. 直接启动生成的 checkpoint ``.bin.zst`` 做恢复验证和后续 CPU 性能测试。
+
+gcpt gemm 的 profiling、SimPoint cluster 和 checkpoint 生成可以直接用脚本复现：
+
+.. code-block:: shell
+
+  scripts/a64-gcpt-simpoint-flow.sh
+
+脚本默认从当前 checkout 所在 workspace 的同级 ``unified-workload`` 中查找 ``qemu-minivirt-aarch64-gcpt/gemm/gcpt/gcpt.bin``，也可以用 ``PAYLOAD=...`` 显式指定；``INTERVAL`` 默认为 ``10000``，``WARMUP`` 默认为 ``5000``。流程由 workload 内的 simtrap 控制开始和结束，不使用额外的 max-insn 截断；输出目录默认在 ``/tmp``，可用 ``OUT_DIR=...`` 覆盖。脚本不接受包含空白字符的路径。
+
+主流程使用 ``dump-final=false``，只把完整 interval 交给 SimPoint。原始聚类结果保存在 ``simpoints0.raw`` 和 ``weights0.raw``；measurement point 小于 ``WARMUP`` 的代表点记录到 ``dropped-warmup.tsv`` 并从 checkpoint 输入中移除，剩余 ``weights0`` 重新归一化到 100%。这是有意保留的启动阶段丢弃策略。脚本要求每个保留代表点都成功生成 checkpoint，运行时越过 measurement point 或缺少文件都会使流程失败。``summary.txt`` 会记录 profile 尾段、丢弃点原始权重和保留点原始权重；``slices.tsv`` 和 ``restore-validation.tsv`` 分别校验每个保留 slice 的请求切点、实际 checkpoint 切点和 restore PC。

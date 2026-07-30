@@ -120,11 +120,6 @@ struct DisasContextBase {
  *      counter. When present, the generic translator increments it once for
  *      every guest instruction before translating that instruction.
  *
- * @checkpoint_check:
- *      Optional target hook emitted before @cpu_exec_count is incremented for
- *      the current instruction. This lets a target inspect an exact
- *      already-executed instruction count and the current PC before the next
- *      guest instruction changes architectural state.
  */
 typedef struct TranslatorOps {
     void (*init_disas_context)(DisasContextBase *db, CPUState *cpu);
@@ -134,7 +129,6 @@ typedef struct TranslatorOps {
     void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
     bool (*disas_log)(const DisasContextBase *db, CPUState *cpu, FILE *f);
     TCGv_i64 *cpu_exec_count;
-    void (*checkpoint_check)(DisasContextBase *db, CPUState *cpu);
 } TranslatorOps;
 
 /**

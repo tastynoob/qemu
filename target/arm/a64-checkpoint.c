@@ -739,11 +739,13 @@ out:
 #endif
 
 static bool dump_checkpoint(CPUARMState *env, uint64_t pc,
+                            uint64_t actual_insns,
                             const A64CheckpointPoint *point)
 {
     g_autofree char *path = checkpoint_output_path(point);
     g_autofree char *dir = g_path_get_dirname(path);
     uint8_t *ram_ptr = memory_region_get_ram_ptr(a64_cpt.ram);
+    uint64_t overshoot = actual_insns - point->checkpoint_insns;
     int fd;
     int ret;
 
@@ -778,11 +780,12 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc,
         return false;
     }
 
-    info_report("a64 checkpoint: wrote zstd checkpoint %s at relative "
-                "instruction %" PRIu64 " pc=0x%" PRIx64
+    info_report("a64 checkpoint: wrote zstd checkpoint %s at requested "
+                "relative instruction %" PRIu64 " actual=%" PRIu64
+                " overshoot=%" PRIu64 " pc=0x%" PRIx64
                 " measurement=%" PRIu64 " warmup=%" PRIu64,
-                path, point->checkpoint_insns, pc, point->measure_insns,
-                point->warmup_insns);
+                path, point->checkpoint_insns, actual_insns, overshoot, pc,
+                point->measure_insns, point->warmup_insns);
     return true;
 #endif
 }
@@ -862,7 +865,56 @@ bool a64_checkpoint_has_pending(void)
            a64_cpt.next_point < a64_cpt.points->len;
 }
 
-void a64_checkpoint_notify_profiler(CPUARMState *env, bool start)
+static void a64_checkpoint_try_take_at(CPUARMState *env, uint64_t pc,
+                                       uint64_t absolute_insns)
+{
+    uint64_t rel_insns;
+
+    if (!a64_checkpoint_has_pending() || !a64_cpt.window_started ||
+        a64_cpt.writing || absolute_insns < a64_cpt.window_base) {
+        return;
+    }
+
+    rel_insns = absolute_insns - a64_cpt.window_base;
+    a64_cpt.writing = true;
+    while (a64_checkpoint_has_pending()) {
+        A64CheckpointPoint *point =
+            &g_array_index(a64_cpt.points, A64CheckpointPoint,
+                           a64_cpt.next_point);
+
+        if (rel_insns < point->checkpoint_insns) {
+            break;
+        }
+        if (rel_insns > point->measure_insns) {
+            uint64_t overshoot = rel_insns - point->checkpoint_insns;
+            uint64_t late = rel_insns - point->measure_insns;
+
+            a64_cpt.dropped_points++;
+            info_report("a64 checkpoint: skipping measurement point %" PRIu64
+                        " because checkpoint boundary actual=%" PRIu64
+                        " is after measurement point; requested=%" PRIu64
+                        " overshoot=%" PRIu64 " late=%" PRIu64
+                        " pc=0x%" PRIx64 " warmup=%" PRIu64,
+                        point->measure_insns, rel_insns,
+                        point->checkpoint_insns, overshoot, late, pc,
+                        point->warmup_insns);
+            a64_cpt.next_point++;
+            continue;
+        }
+        if (dump_checkpoint(env, pc, rel_insns, point)) {
+            a64_cpt.next_point++;
+        } else {
+            break;
+        }
+    }
+    a64_cpt.writing = false;
+
+    if (!a64_checkpoint_has_pending() && a64_cpt.exit_after_last) {
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
+    }
+}
+
+void a64_checkpoint_notify_profiler(CPUARMState *env, bool start, uint64_t pc)
 {
     if (!a64_cpt.enabled) {
         return;
@@ -874,6 +926,9 @@ void a64_checkpoint_notify_profiler(CPUARMState *env, bool start)
         info_report("a64 checkpoint: profiling window started at absolute "
                     "instruction %" PRIu64, a64_cpt.window_base);
     } else {
+        if (env->profiling_insns > 0) {
+            a64_checkpoint_try_take_at(env, pc, env->profiling_insns - 1);
+        }
         a64_cpt.window_started = false;
         info_report("a64 checkpoint: profiling window stopped at absolute "
                     "instruction %" PRIu64, env->profiling_insns);
@@ -882,32 +937,5 @@ void a64_checkpoint_notify_profiler(CPUARMState *env, bool start)
 
 void a64_checkpoint_try_take(CPUARMState *env, uint64_t pc)
 {
-    uint64_t rel_insns;
-
-    if (!a64_checkpoint_has_pending() || !a64_cpt.window_started ||
-        a64_cpt.writing || env->profiling_insns < a64_cpt.window_base) {
-        return;
-    }
-
-    rel_insns = env->profiling_insns - a64_cpt.window_base;
-    a64_cpt.writing = true;
-    while (a64_checkpoint_has_pending()) {
-        A64CheckpointPoint *point =
-            &g_array_index(a64_cpt.points, A64CheckpointPoint,
-                           a64_cpt.next_point);
-
-        if (rel_insns < point->checkpoint_insns) {
-            break;
-        }
-        if (dump_checkpoint(env, pc, point)) {
-            a64_cpt.next_point++;
-        } else {
-            break;
-        }
-    }
-    a64_cpt.writing = false;
-
-    if (!a64_checkpoint_has_pending() && a64_cpt.exit_after_last) {
-        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
-    }
+    a64_checkpoint_try_take_at(env, pc, env->profiling_insns);
 }

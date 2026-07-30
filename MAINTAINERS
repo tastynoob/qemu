@@ -4160,6 +4160,7 @@ F: tests/tcg/multiarch/plugin/
 F: tests/functional/aarch64/test_tcg_plugins.py
 F: contrib/plugins/
 F: scripts/qemu-plugin-symbols.py
+F: scripts/a64-gcpt-simpoint-flow.sh
 
 AArch64 TCG target
 M: Richard Henderson <richard.henderson@linaro.org>

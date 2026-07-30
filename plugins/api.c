@@ -65,6 +65,17 @@ bool qemu_plugin_a64_simtrap_in_profiling_mode(void)
     return qatomic_read(&a64_simtrap_profiling_mode);
 }
 
+bool qemu_plugin_read_exec_count(uint64_t *count)
+{
+    g_assert(current_cpu);
+
+    if (!count || !current_cpu->plugin_exec_count) {
+        return false;
+    }
+    *count = *current_cpu->plugin_exec_count;
+    return true;
+}
+
 /* Uninstall and Reset handlers */
 
 void qemu_plugin_uninstall(qemu_plugin_id_t id, qemu_plugin_udata_cb_t cb,

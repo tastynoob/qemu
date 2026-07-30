@@ -552,6 +552,7 @@ struct CPUState {
 
 #ifdef CONFIG_PLUGIN
     CPUPluginState *plugin_state;
+    uint64_t *plugin_exec_count;
 #endif
 
     /* TODO Move common fields from CPUArchState here. */

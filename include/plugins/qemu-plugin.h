@@ -1305,6 +1305,17 @@ QEMU_PLUGIN_API
 void qemu_plugin_a64_simtrap_set_profiling_mode(bool enabled);
 
 /**
+ * qemu_plugin_read_exec_count() - read the target-maintained execution count
+ *
+ * @count: destination for the current vCPU instruction count
+ *
+ * This function is only valid in a vCPU callback. It returns false when the
+ * target does not provide an execution counter.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_read_exec_count(uint64_t *count);
+
+/**
  * qemu_plugin_scoreboard_new() - alloc a new scoreboard
  *
  * @element_size: size (in bytes) for one entry

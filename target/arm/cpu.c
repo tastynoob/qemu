@@ -1219,6 +1219,10 @@ static void arm_cpu_initfn(Object *obj)
 {
     ARMCPU *cpu = ARM_CPU(obj);
 
+#ifdef CONFIG_PLUGIN
+    CPU(cpu)->plugin_exec_count = &cpu->env.profiling_insns;
+#endif
+
     cpu->cp_regs = g_hash_table_new_full(g_direct_hash, g_direct_equal,
                                          NULL, g_free);
 

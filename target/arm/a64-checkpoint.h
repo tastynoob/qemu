@@ -28,7 +28,7 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
 bool a64_checkpoint_is_enabled(void);
 bool a64_checkpoint_has_pending(void);
 void a64_checkpoint_try_take(CPUARMState *env, uint64_t pc);
-void a64_checkpoint_notify_profiler(CPUARMState *env, bool start);
+void a64_checkpoint_notify_profiler(CPUARMState *env, bool start, uint64_t pc);
 #else
 static inline bool a64_checkpoint_is_enabled(void)
 {
@@ -44,7 +44,8 @@ static inline void a64_checkpoint_try_take(CPUARMState *env, uint64_t pc)
 {
 }
 
-static inline void a64_checkpoint_notify_profiler(CPUARMState *env, bool start)
+static inline void a64_checkpoint_notify_profiler(CPUARMState *env, bool start,
+                                                  uint64_t pc)
 {
 }
 #endif

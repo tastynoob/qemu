@@ -44,6 +44,8 @@
 #include <zlib.h> /* for crc32 */
 #ifdef CONFIG_USER_ONLY
 #include "user/page-protection.h"
+#else
+#include "system/runstate.h"
 #endif
 #include "vec_internal.h"
 
@@ -139,7 +141,7 @@ static void a64_simtrap_restore_daif(CPUARMState *env)
     }
 }
 
-void HELPER(a64_simtrap)(CPUARMState *env, uint32_t imm)
+void HELPER(a64_simtrap)(CPUARMState *env, uint32_t imm, uint64_t pc)
 {
     switch (imm) {
     case SIMTRAP_DISABLE_TIME_INTR:
@@ -147,11 +149,14 @@ void HELPER(a64_simtrap)(CPUARMState *env, uint32_t imm)
         break;
     case A64_SIMTRAP_PROFILE_START:
         a64_simtrap_mask_daif(env);
-        a64_checkpoint_notify_profiler(env, true);
+        a64_checkpoint_notify_profiler(env, true, pc);
         break;
     case A64_SIMTRAP_PROFILE_STOP:
-        a64_checkpoint_notify_profiler(env, false);
+        a64_checkpoint_notify_profiler(env, false, pc);
         a64_simtrap_restore_daif(env);
+#ifndef CONFIG_USER_ONLY
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+#endif
         break;
     default:
         g_assert_not_reached();
