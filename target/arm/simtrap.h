@@ -19,9 +19,14 @@
     ((imm) == A64_SIMTRAP_PROFILE_START || \
      (imm) == A64_SIMTRAP_PROFILE_STOP)
 
+#define A64_SIMTRAP_IS_EXIT_SIGNAL(imm) \
+    ((imm) == SIMTRAP_GOOD_TRAP || \
+     (imm) == SIMTRAP_NOTIFY_WORKLOAD_EXIT)
+
 #define A64_SIMTRAP_IS_HANDLED(imm) \
     ((imm) == SIMTRAP_DISABLE_TIME_INTR || \
-     A64_SIMTRAP_IS_PROFILE_SIGNAL(imm))
+     A64_SIMTRAP_IS_PROFILE_SIGNAL(imm) || \
+     A64_SIMTRAP_IS_EXIT_SIGNAL(imm))
 
 #ifdef CONFIG_PLUGIN
 bool qemu_plugin_a64_simtrap_in_profiling_mode(void);

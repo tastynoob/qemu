@@ -3345,6 +3345,7 @@ static bool trans_HLT(DisasContext *s, arg_i *a)
 #ifndef CONFIG_USER_ONLY
     if (A64_SIMTRAP_IS_HANDLED(a->imm)) {
         if (a->imm == SIMTRAP_DISABLE_TIME_INTR ||
+            A64_SIMTRAP_IS_EXIT_SIGNAL(a->imm) ||
             qemu_plugin_a64_simtrap_in_profiling_mode() ||
             a64_checkpoint_is_enabled()) {
             gen_helper_a64_simtrap(tcg_env, tcg_constant_i32(a->imm),

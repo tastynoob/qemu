@@ -50,7 +50,10 @@ AArch64 使用 ``HLT #imm`` 作为 sim trap 伪指令。signal 编码与 XiangSh
      - profiling/checkpoint window start。
    * - ``SIMTRAP_NOTIFY_WORKLOAD_EXIT``
      - ``0x102``
-     - profiling/checkpoint window stop。
+     - profiling/checkpoint window stop，并请求 QEMU 正常退出。
+   * - ``SIMTRAP_GOOD_TRAP``
+     - ``0x000``
+     - 兼容旧 workload 的成功结束信号，并请求 QEMU 正常退出。
 
 边界语义：
 
@@ -59,7 +62,7 @@ AArch64 使用 ``HLT #imm`` 作为 sim trap 伪指令。signal 编码与 XiangSh
 * checkpoint 输入切点 ``N`` 表示 profiling window 内的计性能起点。默认 ``warmup-interval=0`` 时，请求 snapshot 位置为 ``N``；如果设置了 warmup，则请求 snapshot 位置为 ``N - warmup-interval``，实际 snapshot 在不早于该请求位置的第一个 checkpoint 检查边界生成。常规检查边界是 TB 入口，``PROFILE_STOP`` 关闭 window 前也会补查一次。恢复后先执行 warmup 段，再进入计性能区间；TB 边界越过会让实际 warmup 略短。如果实际检查边界已经越过 ``N``，该 slice 会被跳过，避免从计性能区间内部恢复。若 ``N < warmup-interval``，该切点会被丢弃，不会为单个 slice 自动缩短 warmup。
 * profiling/checkpoint 采集运行中，``PROFILE_START`` 会关闭中断。
 * checkpoint restore 运行中，关中断由 gcpt restorer 负责，不依赖 QEMU 再处理 profiling sim trap。
-* 非 profiling/checkpoint 模式下，``0x101`` 和 ``0x102`` 被当作 nop；``0x100`` 仍会关闭中断。
+* 非 profiling/checkpoint 模式下，``0x101`` 被当作 nop；``0x102`` 和 ``0x000`` 仍会请求 QEMU 正常退出，``0x100`` 仍会关闭中断。
 
 
 Profiling 模式

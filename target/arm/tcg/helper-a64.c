@@ -141,9 +141,19 @@ static void a64_simtrap_restore_daif(CPUARMState *env)
     }
 }
 
+static void a64_simtrap_shutdown(void)
+{
+#ifndef CONFIG_USER_ONLY
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
+#endif
+}
+
 void HELPER(a64_simtrap)(CPUARMState *env, uint32_t imm, uint64_t pc)
 {
     switch (imm) {
+    case SIMTRAP_GOOD_TRAP:
+        a64_simtrap_shutdown();
+        break;
     case SIMTRAP_DISABLE_TIME_INTR:
         a64_simtrap_mask_daif(env);
         break;
@@ -154,9 +164,7 @@ void HELPER(a64_simtrap)(CPUARMState *env, uint32_t imm, uint64_t pc)
     case A64_SIMTRAP_PROFILE_STOP:
         a64_checkpoint_notify_profiler(env, false, pc);
         a64_simtrap_restore_daif(env);
-#ifndef CONFIG_USER_ONLY
-        qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
-#endif
+        a64_simtrap_shutdown();
         break;
     default:
         g_assert_not_reached();

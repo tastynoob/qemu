@@ -361,15 +361,17 @@ would resume from inside the measurement interval.
 The signal values match XiangShan's NEMU trap convention:
 ``HLT #0x100`` masks PSTATE ``D/A/I/F`` in QEMU. ``HLT #0x101`` marks
 workload loaded and starts profiling, and ``HLT #0x102`` marks workload exit
-and stops profiling. Outside simpoint profiling, ``HLT #0x101`` and
-``HLT #0x102`` execute as NOPs; ``HLT #0x100`` still masks interrupts. When
-the simpoint plugin uses ``trigger=simtrap``, ``HLT #0x101`` also masks
-``D/A/I/F`` if needed, and ``HLT #0x102`` restores the previous DAIF value and
-requests QEMU shutdown.
-The corresponding encodings are ``.inst 0xd4402000``,
-``.inst 0xd4402020``, and ``.inst 0xd4402040``. The simtrap instructions are
-not counted in the BBV: profiling starts at the instruction after
-``HLT #0x101`` and ends at the instruction before ``HLT #0x102``.
+and stops profiling. Outside simpoint profiling, ``HLT #0x101`` executes as a
+NOP, while ``HLT #0x102`` and the legacy ``HLT #0x000`` good-trap signal
+request QEMU shutdown. ``HLT #0x100`` still masks interrupts. When the
+simpoint plugin uses ``trigger=simtrap``, ``HLT #0x101`` also masks
+``D/A/I/F`` if needed, and ``HLT #0x102`` restores the previous DAIF value
+before requesting shutdown.
+The encodings for ``HLT #0x000``, ``HLT #0x100``, ``HLT #0x101``, and
+``HLT #0x102`` are ``.inst 0xd4400000``, ``.inst 0xd4402000``,
+``.inst 0xd4402020``, and ``.inst 0xd4402040``, respectively. The simtrap
+instructions are not counted in the BBV: profiling starts at the instruction
+after ``HLT #0x101`` and ends at the instruction before ``HLT #0x102``.
 For reproducible full-system profiling runs, use deterministic instruction
 counting such as ``-icount shift=0,sleep=off`` so timer-driven guest state does
 not change the profiled instruction stream between runs.
