@@ -27,6 +27,8 @@ Environment overrides:
   QEMU_BIN=/path/to/qemu-system-aarch64
   SIMPOINT_BIN=/path/to/SimPoint.3.2-fix/bin/simpoint
   SIMPOINT_PLUGIN=/path/to/libsimpoint.so
+  ZSTD_BIN=/path/to/zstd
+  CPU_MODEL=cortex-a57
   INTERVAL=10000
   WARMUP=5000
   MEMORY=1G
@@ -489,6 +491,40 @@ normalize_pc()
         sed -E 's/^0x0*([0-9a-f])$/0x\1/; s/^0x0*([0-9a-f][0-9a-f]+)$/0x\1/'
 }
 
+read_snapshot_pc()
+{
+    local checkpoint_path=$1
+    local bytes_text
+    local magic=
+    local version=
+    local pc=
+    local -a bytes
+    local i
+
+    bytes_text=$(
+        dd if=<("$zstd_bin" -dc -- "$checkpoint_path" 2> /dev/null) \
+            bs=1 skip=$((0x100000)) count=72 status=none |
+            od -An -v -tx1
+    )
+    read -r -a bytes <<< "$(tr '\n' ' ' <<< "$bytes_text")"
+    (( ${#bytes[@]} == 72 )) || return 1
+
+    for ((i = 7; i >= 0; i--)); do
+        magic+="${bytes[i]}"
+    done
+    for ((i = 15; i >= 8; i--)); do
+        version+="${bytes[i]}"
+    done
+    [[ "$magic" == 0050414e53343641 ]] || return 1
+    [[ "$version" == 0000000000000001 ]] || return 1
+
+    for ((i = 71; i >= 64; i--)); do
+        pc+="${bytes[i]}"
+    done
+    pc=$(sed -E 's/^0+//; s/^$/0/' <<< "$pc")
+    printf '0x%s\n' "$pc"
+}
+
 run_restore_qemu()
 {
     local checkpoint_path=$1
@@ -502,7 +538,7 @@ run_restore_qemu()
         "$qemu_bin" \
             -icount shift=0,sleep=off \
             -machine mini-virt \
-            -cpu cortex-a57 \
+            -cpu "$cpu_model" \
             -smp 1 \
             -m "$memory" \
             -nographic \
@@ -514,7 +550,7 @@ run_restore_qemu()
     timeout "$restore_timeout" "$qemu_bin" \
         -icount shift=0,sleep=off \
         -machine mini-virt \
-        -cpu cortex-a57 \
+        -cpu "$cpu_model" \
         -smp 1 \
         -m "$memory" \
         -nographic \
@@ -526,14 +562,11 @@ validate_restores()
 {
     local restore_dir=$out_dir/restore-validation
     local report=$out_dir/restore-validation.tsv
-    local report_header='measurement\tcheckpoint\texpected_pc\trestore_pc'
-    local restore_pc_re
+    local report_header='measurement\tcheckpoint\texpected_pc\tsnapshot_pc'
     local fail_count=0
     local restore_count=0
 
-    report_header+='\texit_code\tstatus'
-    restore_pc_re='s/.*\[a64-gcpt\] restore pc='
-    restore_pc_re+='\(0x[0-9a-fA-F]*\).*/\1/p'
+    report_header+='\tprofile_start_seen\texit_code\tstatus'
     rm -rf "$restore_dir"
     mkdir -p "$restore_dir"
     printf '%b\n' "$report_header" > "$report"
@@ -544,9 +577,10 @@ validate_restores()
         [[ "$status" == ok ]] || continue
 
         local slice_dir=$restore_dir/measure-$measurement
-        local restore_pc=
+        local snapshot_pc=
         local expected_norm=
-        local restore_norm=
+        local snapshot_norm=
+        local profile_start_seen=0
         local row_status=ok
         local exit_code
 
@@ -557,15 +591,23 @@ validate_restores()
         exit_code=$?
         set -e
 
-        restore_pc=$(sed -n "$restore_pc_re" \
-            "$slice_dir/stdout" | head -n 1)
+        snapshot_pc=$(read_snapshot_pc "$checkpoint_path" || true)
         expected_norm=$(normalize_pc "$pc")
-        restore_norm=$(normalize_pc "$restore_pc")
+        snapshot_norm=$(normalize_pc "$snapshot_pc")
 
-        if [[ -z "$restore_pc" ]]; then
-            row_status=missing_restore_pc
-        elif [[ "$restore_norm" != "$expected_norm" ]]; then
+        if [[ -z "$snapshot_pc" ]]; then
+            row_status=missing_snapshot_pc
+        elif [[ "$snapshot_norm" != "$expected_norm" ]]; then
             row_status=pc_mismatch
+        fi
+        if grep -Eq '^simpoint: vcpu [0-9]+ profiling started$' \
+            "$slice_dir/stderr"; then
+            profile_start_seen=1
+            if [[ "$row_status" == ok ]]; then
+                row_status=unexpected_profile_start
+            else
+                row_status=${row_status}_unexpected_profile_start
+            fi
         fi
         if [[ "$exit_code" -ne 0 ]]; then
             row_status=${row_status}_exit_$exit_code
@@ -574,14 +616,16 @@ validate_restores()
             fail_count=$((fail_count + 1))
         fi
 
-        printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+        printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
             "$measurement" "$checkpoint_path" "$expected_norm" \
-            "$restore_norm" "$exit_code" "$row_status" >> "$report"
+            "$snapshot_norm" "$profile_start_seen" "$exit_code" \
+            "$row_status" >> "$report"
         restore_count=$((restore_count + 1))
     done < <(tail -n +2 "$out_dir/slices.tsv")
 
     (( fail_count == 0 )) || die "restore validation failed; see $report"
-    info "validated $restore_count checkpoint restore PC(s); report: $report"
+    info "validated $restore_count checkpoint header PC(s) and restore run(s)"
+    info "restore report: $report"
 }
 
 write_summary()
@@ -592,6 +636,7 @@ write_summary()
     {
         printf 'payload\t%s\n' "$payload"
         printf 'qemu\t%s\n' "$qemu_bin"
+        printf 'cpu_model\t%s\n' "$cpu_model"
         printf 'simpoint\t%s\n' "$simpoint_bin"
         printf 'interval\t%s\n' "$interval"
         printf 'warmup\t%s\n' "$warmup"
@@ -639,6 +684,7 @@ payload=${PAYLOAD:-$default_payload}
 build_dir=${BUILD_DIR:-$repo_root/build}
 qemu_bin=${QEMU_BIN:-$build_dir/qemu-system-aarch64}
 simpoint_plugin=${SIMPOINT_PLUGIN:-$build_dir/contrib/plugins/libsimpoint.so}
+zstd_bin=${ZSTD_BIN:-$(command -v zstd || true)}
 simpoint_bin=$(find_simpoint_bin) ||
     die "set SIMPOINT_BIN or place SimPoint at" \
         "../SimPoint.3.2-fix/bin/simpoint"
@@ -646,6 +692,7 @@ simpoint_bin=$(find_simpoint_bin) ||
 interval=${INTERVAL:-10000}
 warmup=${WARMUP:-5000}
 memory=${MEMORY:-1G}
+cpu_model=${CPU_MODEL:-cortex-a57}
 maxk=${MAXK:-30}
 num_init_seeds=${NUM_INIT_SEEDS:-2}
 iters=${ITERS:-1000}
@@ -680,12 +727,16 @@ require_path_without_whitespace BUILD_DIR "$build_dir"
 require_path_without_whitespace QEMU_BIN "$qemu_bin"
 require_path_without_whitespace SIMPOINT_PLUGIN "$simpoint_plugin"
 require_path_without_whitespace SIMPOINT_BIN "$simpoint_bin"
+require_path_without_whitespace ZSTD_BIN "$zstd_bin"
 require_path_without_whitespace OUT_DIR "$out_dir"
 
 require_file "$payload"
 require_exec "$qemu_bin"
 require_exec "$simpoint_bin"
 require_exec "$simpoint_plugin"
+if [[ "$restore_validate" == 1 ]]; then
+    require_exec "$zstd_bin"
+fi
 
 profile_dir=$out_dir/profile
 cluster_dir=$out_dir/cluster
@@ -710,7 +761,7 @@ profile_cmd=(
     "$qemu_bin"
     -icount shift=0,sleep=off
     -machine mini-virt
-    -cpu cortex-a57
+    -cpu "$cpu_model"
     -smp 1
     -m "$memory"
     -nographic
@@ -762,7 +813,7 @@ checkpoint_cmd=(
     "$qemu_bin"
     -icount shift=0,sleep=off
     -machine "$checkpoint_machine"
-    -cpu cortex-a57
+    -cpu "$cpu_model"
     -smp 1
     -m "$memory"
     -nographic

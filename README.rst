@@ -77,7 +77,7 @@ profiling 通过 ``libsimpoint.so`` 插件生成 gzip 压缩的 SimPoint 3.2 BBV
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
     -machine mini-virt \
-    -cpu cortex-a57 \
+    -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
     -nographic \
@@ -142,7 +142,7 @@ checkpoint 模式根据切点在 profiling window 内生成 snapshot。切点可
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
     -machine mini-virt,checkpoint-mode=SimpointCheckpoint,cutpoints=<cutpoint-list>,checkpoint-dir=<checkpoint-dir> \
-    -cpu cortex-a57 \
+    -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
     -nographic \
@@ -155,7 +155,7 @@ SimPoint cluster 切点命令模板：
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
     -machine mini-virt,checkpoint-mode=SimpointCheckpoint,simpoint-path=<simpoint-dir>,cpt-interval=<interval>,warmup-interval=<warmup>,checkpoint-dir=<checkpoint-dir> \
-    -cpu cortex-a57 \
+    -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
     -nographic \
@@ -208,9 +208,12 @@ snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM im
 
 * 逻辑大小等于 ``-m`` 指定的 RAM 大小。
 * restorer 和原始 payload 保持在 image 低地址区域。
-* AArch64 checkpoint metadata 写在文件偏移 ``0x100000``。
-* per-core architectural state 写在文件偏移 ``0x101000``。
-* 格式参考 ``libcheckpoint-for-aarch64`` 的 ``a64_checkpoint_format.h``。
+* 单核 ``a64_snapshot_header`` 写在文件偏移 ``0x100000``，各寄存器块紧随
+  header，以16字节对齐的紧凑流形式存放；header中的所有offset均相对于
+  ``0x100000``。
+* 格式参考 ``libcheckpoint-for-aarch64`` 的 ``a64_checkpoint_format.h``，
+  当前writer只生成 ``A64_CPT_SNAPSHOT_VERSION == 1`` 的流式格式，不兼容旧
+  snapshot header。
 
 当前保存内容：
 
@@ -218,13 +221,24 @@ snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM im
 * PC、PSTATE、current EL。
 * X0-X30、SP_EL0-SP_EL3。
 * ELR/SPSR EL1-EL3。
-* restorer 支持的一组 EL1/EL2/EL3 sysregs，包括 architectural timer 相关寄存器。
+* 固定顺序的EL1/EL2/EL3通用sysreg块，包括地址转换、异常、线程指针和
+  architectural timer状态；EL2部分包含VHE使用的 ``TTBR1_EL2``。
 * FPSIMD Q0-Q31、FPSR、FPCR。
+* SVE Z0-Z31、P0-P15、FFR、active/max VL和ZCR_EL1-EL3。
+* PAuth APIA/APIB/APDA/APDB/APGA key low/high pairs。
 
 当前不保存：
 
 * GIC、PL011、QEMU device 内部状态。
-* SVE、SME、MTE、PAUTH 扩展状态。
+* SME状态。
+* MTE系统寄存器和allocation tag memory。
+* FPMR和SCXTNUM。
+
+如果checkpoint边界存在新版格式无法承载的非零SME、MTE、FPMR或SCXTNUM
+状态，writer会报错并停止checkpoint流程，不会静默生成缺失状态的文件。
+生成和恢复必须使用兼容的 CPU feature 集；SVE restore CPU 的 vector length
+能力不能小于 checkpoint 中记录的 active VL。带 SVE/PAuth 状态的 checkpoint
+需要使用包含新版 ``libcheckpoint-for-aarch64`` restorer 的 gcpt payload。
 
 
 恢复 checkpoint
@@ -237,29 +251,23 @@ snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM im
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
     -machine mini-virt \
-    -cpu cortex-a57 \
+    -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
     -nographic \
     -kernel <checkpoint.bin.zst> \
     -plugin build/contrib/plugins/libstoptrigger.so,icount=<max-instructions>:0
 
-正常恢复时，串口会先输出 restorer 信息：
-
-.. code-block:: text
-
-  [a64-gcpt] restorer start base=0x... el=0x...
-  [a64-gcpt] checkpoint header cpt_base=0x...
-  [a64-gcpt] restore pc=0x... pstate=0x...
-
-可以用 ``stoptrigger`` 验证恢复 PC。将 ``<restore-pc>`` 替换为 restorer 打印出的 PC：
+新版restorer成功路径不打印状态，只在校验或恢复失败时输出错误并停机。可以用
+``stoptrigger`` 验证恢复PC；将 ``<restore-pc>`` 替换为checkpoint生成日志中的
+``pc=`` 值或snapshot header中的 ``pc``：
 
 .. code-block:: shell
 
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
     -machine mini-virt \
-    -cpu cortex-a57 \
+    -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
     -nographic \
@@ -273,6 +281,11 @@ snapshot 默认写成 zstd 压缩文件。解压后的内容是完整 raw RAM im
 .. code-block:: text
 
   <restore-pc> reached, exiting
+
+仅当 ``<restore-pc>`` 不落在restorer自身启动代码地址范围内时，单独的地址
+trigger才能证明已经完成恢复；否则启动阶段可能先命中同一地址。通用验证应使用
+下述流程脚本，同时检查snapshot header、确认恢复过程中没有再次执行
+PROFILE_START，并要求恢复后的workload正常运行到PROFILE_STOP。
 
 
 推荐流程
@@ -290,6 +303,6 @@ gcpt gemm 的 profiling、SimPoint cluster 和 checkpoint 生成可以直接用�
 
   scripts/a64-gcpt-simpoint-flow.sh
 
-脚本默认从当前 checkout 所在 workspace 的同级 ``unified-workload`` 中查找 ``qemu-minivirt-aarch64-gcpt/gemm/gcpt/gcpt.bin``，也可以用 ``PAYLOAD=...`` 显式指定；``INTERVAL`` 默认为 ``10000``，``WARMUP`` 默认为 ``5000``。流程由 workload 内的 simtrap 控制开始和结束，不使用额外的 max-insn 截断；输出目录默认在 ``/tmp``，可用 ``OUT_DIR=...`` 覆盖。脚本不接受包含空白字符的路径。
+脚本默认从当前 checkout 所在 workspace 的同级 ``unified-workload`` 中查找 ``qemu-minivirt-aarch64-gcpt/gemm/gcpt/gcpt.bin``，也可以用 ``PAYLOAD=...`` 显式指定；``CPU_MODEL`` 默认为 ``cortex-a57``，profiling、checkpoint 和 restore validation 始终使用同一个值；``INTERVAL`` 默认为 ``10000``，``WARMUP`` 默认为 ``5000``。流程由 workload 内的 simtrap 控制开始和结束，不使用额外的 max-insn 截断；输出目录默认在 ``/tmp``，可用 ``OUT_DIR=...`` 覆盖。脚本不接受包含空白字符的路径。恢复校验直接读取流式header中的PC并与生成日志比对，同时要求恢复后的workload正常执行到PROFILE_STOP，不再依赖旧restorer的成功日志。
 
-主流程使用 ``dump-final=false``，只把完整 interval 交给 SimPoint。原始聚类结果保存在 ``simpoints0.raw`` 和 ``weights0.raw``；measurement point 小于 ``WARMUP`` 的代表点记录到 ``dropped-warmup.tsv`` 并从 checkpoint 输入中移除，剩余 ``weights0`` 重新归一化到 100%。这是有意保留的启动阶段丢弃策略。脚本要求每个保留代表点都成功生成 checkpoint，运行时越过 measurement point 或缺少文件都会使流程失败。``summary.txt`` 会记录 profile 尾段、丢弃点原始权重和保留点原始权重；``slices.tsv`` 和 ``restore-validation.tsv`` 分别校验每个保留 slice 的请求切点、实际 checkpoint 切点和 restore PC。
+主流程使用 ``dump-final=false``，只把完整 interval 交给 SimPoint。原始聚类结果保存在 ``simpoints0.raw`` 和 ``weights0.raw``；measurement point 小于 ``WARMUP`` 的代表点记录到 ``dropped-warmup.tsv`` 并从 checkpoint 输入中移除，剩余 ``weights0`` 重新归一化到 100%。这是有意保留的启动阶段丢弃策略。脚本要求每个保留代表点都成功生成 checkpoint，运行时越过 measurement point 或缺少文件都会使流程失败。``summary.txt`` 会记录 profile 尾段、丢弃点原始权重和保留点原始权重；``slices.tsv`` 和 ``restore-validation.tsv`` 分别校验每个保留 slice 的请求/实际切点，以及snapshot header PC和恢复执行结果。

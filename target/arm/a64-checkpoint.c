@@ -22,59 +22,28 @@
 #include <zstd.h>
 #endif
 
-#define A64_CPT_MAGIC_NUMBER UINT64_C(0xdeadbeef)
-#define A64_CPT_CORE_MAGIC_NUMBER UINT64_C(0xbeef)
-#define A64_CPT_VERSION UINT64_C(0x20260705)
-#define A64_CPT_SINGLE_CORE_SIZE UINT64_C(0x100000)
+#define A64_CPT_SNAPSHOT_MAGIC UINT64_C(0x0050414e53343641)
+#define A64_CPT_SNAPSHOT_VERSION UINT64_C(1)
+#define A64_CPT_SNAPSHOT_HEADER_SIZE UINT64_C(256)
 #define A64_CPT_RESTORER_RESERVED_SIZE UINT64_C(0x100000)
 #define A64_CPT_DEFAULT_HEADER_OFFSET A64_CPT_RESTORER_RESERVED_SIZE
-#define A64_CPT_METADATA_ALIGN UINT64_C(0x1000)
+#define A64_CPT_STREAM_ALIGN UINT64_C(16)
 #define A64_CPT_ZSTD_CHUNK_SIZE (1 * MiB)
 #define A64_CPT_ZSTD_LEVEL 1
 
 #define A64_CPT_FLAG_HAS_FPSIMD (UINT64_C(1) << 0)
+#define A64_CPT_FLAG_HAS_SVE    (UINT64_C(1) << 1)
+#define A64_CPT_FLAG_HAS_PAUTH  (UINT64_C(1) << 4)
 
-#define A64_CPT_MAX_SYSREG_RECORDS 512U
-#define A64_CPT_SYSREG_RECORD_F_RESTORE (UINT16_C(1) << 0)
-
-#define A64_CPT_RESTORER_CNTP_CTL_EL0  UINT16_C(0xdec1)
-#define A64_CPT_RESTORER_CNTP_CVAL_EL0 UINT16_C(0xdec2)
-#define A64_CPT_RESTORER_CNTV_CTL_EL0  UINT16_C(0xded9)
-#define A64_CPT_RESTORER_CNTV_CVAL_EL0 UINT16_C(0xdeda)
-
-#define A64_CPT_SYSREG_ENCODING(op0, op1, crn, crm, op2) \
-    ((((uint16_t)(op0) & 0x3U) << 14) |                  \
-     (((uint16_t)(op1) & 0x7U) << 11) |                  \
-     (((uint16_t)(crn) & 0xfU) << 7) |                   \
-     (((uint16_t)(crm) & 0xfU) << 3) |                   \
-     ((uint16_t)(op2) & 0x7U))
-
-#define A64_CPT_OFF_MAGIC       UINT64_C(0x0000)
-#define A64_CPT_OFF_PC          UINT64_C(0x0008)
-#define A64_CPT_OFF_PSTATE      UINT64_C(0x0010)
-#define A64_CPT_OFF_CURRENT_EL  UINT64_C(0x0018)
-#define A64_CPT_OFF_FEATURES    UINT64_C(0x0020)
-#define A64_CPT_OFF_MISC_DONE   UINT64_C(0x0028)
-#define A64_CPT_OFF_INT_REG     UINT64_C(0x1000)
-#define A64_CPT_OFF_INT_DONE    UINT64_C(0x10f8)
-#define A64_CPT_OFF_SP_REG      UINT64_C(0x1100)
-#define A64_CPT_OFF_SP_DONE     UINT64_C(0x1120)
-#define A64_CPT_OFF_ELR_SPSR    UINT64_C(0x1120)
-#define A64_CPT_OFF_ELR_DONE    UINT64_C(0x1150)
-#define A64_CPT_OFF_SYSREG      UINT64_C(0x2000)
-#define A64_CPT_OFF_SYSREG_DONE UINT64_C(0x4010)
-#define A64_CPT_OFF_IDREG       UINT64_C(0x5000)
-#define A64_CPT_OFF_IDREG_DONE  UINT64_C(0x5410)
-#define A64_CPT_OFF_FLOAT_REG   UINT64_C(0x6000)
-#define A64_CPT_OFF_FLOAT_DONE  UINT64_C(0x6210)
-#define A64_CPT_OFF_SVE_REG     UINT64_C(0x10000)
-#define A64_CPT_OFF_SVE_DONE    UINT64_C(0x30000)
-#define A64_CPT_OFF_SME_REG     UINT64_C(0x30000)
-#define A64_CPT_OFF_SME_DONE    UINT64_C(0x60000)
-#define A64_CPT_OFF_MTE_REG     UINT64_C(0x60000)
-#define A64_CPT_OFF_MTE_DONE    UINT64_C(0x70000)
-#define A64_CPT_OFF_PAUTH_REG   UINT64_C(0x70000)
-#define A64_CPT_OFF_PAUTH_DONE  UINT64_C(0x70050)
+#define A64_CPT_SVE_ZREG_COUNT 32U
+#define A64_CPT_SVE_PREG_COUNT 16U
+#define A64_CPT_MAX_SVE_VL_BYTES 256U
+#define A64_CPT_INT_REGS_SIZE (31U * sizeof(uint64_t))
+#define A64_CPT_SP_REGS_SIZE (4U * sizeof(uint64_t))
+#define A64_CPT_ELR_SPSR_SIZE (6U * sizeof(uint64_t))
+#define A64_CPT_SYSREG_STATE_SIZE (49U * sizeof(uint64_t))
+#define A64_CPT_FPSIMD_SIZE (32U * 16U + 2U * sizeof(uint64_t))
+#define A64_CPT_PAUTH_SIZE (10U * sizeof(uint64_t))
 
 typedef struct A64CheckpointPoint {
     uint64_t measure_insns;
@@ -87,6 +56,22 @@ typedef struct A64CheckpointOverlay {
     const uint8_t *data;
     size_t len;
 } A64CheckpointOverlay;
+
+typedef struct A64SnapshotLayout {
+    uint64_t feature_flags;
+    uint64_t int_regs_offset;
+    uint64_t sp_regs_offset;
+    uint64_t elr_spsr_offset;
+    uint64_t sysregs_offset;
+    uint64_t fpsimd_offset;
+    uint64_t sve_zregs_offset;
+    uint64_t sve_pregs_offset;
+    uint64_t sve_ffr_offset;
+    uint64_t sve_vl_bytes;
+    uint64_t sve_max_vl_bytes;
+    uint64_t pauth_offset;
+    uint64_t total_size;
+} A64SnapshotLayout;
 
 typedef struct A64CheckpointState {
     bool enabled;
@@ -106,19 +91,20 @@ typedef struct A64CheckpointState {
 
 static A64CheckpointState a64_cpt;
 
-static void put_u16(void *base, uint64_t off, uint16_t value)
-{
-    stw_le_p((uint8_t *)base + off, value);
-}
-
-static void put_u32(void *base, uint64_t off, uint32_t value)
-{
-    stl_le_p((uint8_t *)base + off, value);
-}
-
 static void put_u64(void *base, uint64_t off, uint64_t value)
 {
     stq_le_p((uint8_t *)base + off, value);
+}
+
+static void put_le_words(void *base, uint64_t off, const uint64_t *words,
+                         size_t len)
+{
+    uint8_t *dst = (uint8_t *)base + off;
+
+    for (size_t i = 0; i < len; i++) {
+        dst[i] = words[i / sizeof(uint64_t)] >>
+                 ((i % sizeof(uint64_t)) * 8);
+    }
 }
 
 static int compare_points(gconstpointer a, gconstpointer b)
@@ -403,168 +389,291 @@ static int zstd_write_input(ZSTD_CCtx *cctx, int fd, const void *buf,
 }
 #endif
 
-static void write_checkpoint_header(uint8_t *metadata)
+static uint64_t checkpoint_feature_flags(CPUARMState *env)
 {
-    uint64_t metadata_size = 40 + 208;
-    uint64_t cpt_offset = ROUND_UP(metadata_size, A64_CPT_METADATA_ALIGN);
-    uint64_t off = 0;
+    ARMCPU *cpu = env_archcpu(env);
+    uint64_t features = 0;
 
-    put_u64(metadata, off, A64_CPT_MAGIC_NUMBER);
-    off += 8;
-    put_u64(metadata, off, cpt_offset);
-    off += 8;
-    put_u64(metadata, off, 1);
-    off += 8;
-    put_u64(metadata, off, A64_CPT_SINGLE_CORE_SIZE);
-    off += 8;
-    put_u64(metadata, off, A64_CPT_VERSION);
+    if (cpu_isar_feature(aa64_fp_simd, cpu)) {
+        features |= A64_CPT_FLAG_HAS_FPSIMD;
+    }
+    if (cpu_isar_feature(aa64_sve, cpu)) {
+        features |= A64_CPT_FLAG_HAS_SVE;
+    }
+    if (cpu_isar_feature(aa64_pauth, cpu)) {
+        features |= A64_CPT_FLAG_HAS_PAUTH;
+    }
+    return features;
 }
 
-static void write_checkpoint_layout(uint8_t *metadata)
+static uint64_t append_snapshot_block(uint64_t *stream_end, uint64_t size)
 {
-    static const uint64_t layout[] = {
-        A64_CPT_OFF_MAGIC,
-        A64_CPT_OFF_PC,
-        A64_CPT_OFF_PSTATE,
-        A64_CPT_OFF_CURRENT_EL,
-        A64_CPT_OFF_FEATURES,
-        A64_CPT_OFF_MISC_DONE,
-        A64_CPT_OFF_INT_REG,
-        A64_CPT_OFF_INT_DONE,
-        A64_CPT_OFF_SP_REG,
-        A64_CPT_OFF_SP_DONE,
-        A64_CPT_OFF_ELR_SPSR,
-        A64_CPT_OFF_ELR_DONE,
-        A64_CPT_OFF_SYSREG,
-        A64_CPT_OFF_SYSREG_DONE,
-        A64_CPT_OFF_IDREG,
-        A64_CPT_OFF_IDREG_DONE,
-        A64_CPT_OFF_FLOAT_REG,
-        A64_CPT_OFF_FLOAT_DONE,
-        A64_CPT_OFF_SVE_REG,
-        A64_CPT_OFF_SVE_DONE,
-        A64_CPT_OFF_SME_REG,
-        A64_CPT_OFF_SME_DONE,
-        A64_CPT_OFF_MTE_REG,
-        A64_CPT_OFF_MTE_DONE,
-        A64_CPT_OFF_PAUTH_REG,
-        A64_CPT_OFF_PAUTH_DONE,
+    uint64_t offset = ROUND_UP(*stream_end, A64_CPT_STREAM_ALIGN);
+
+    g_assert(size <= UINT64_MAX - offset);
+    *stream_end = offset + size;
+    return offset;
+}
+
+static void build_snapshot_layout(CPUARMState *env, A64SnapshotLayout *layout)
+{
+    ARMCPU *cpu = env_archcpu(env);
+    uint64_t stream_end = A64_CPT_SNAPSHOT_HEADER_SIZE;
+
+    memset(layout, 0, sizeof(*layout));
+    layout->feature_flags = checkpoint_feature_flags(env);
+    layout->int_regs_offset = append_snapshot_block(&stream_end,
+                                                     A64_CPT_INT_REGS_SIZE);
+    layout->sp_regs_offset = append_snapshot_block(&stream_end,
+                                                   A64_CPT_SP_REGS_SIZE);
+    layout->elr_spsr_offset = append_snapshot_block(&stream_end,
+                                                    A64_CPT_ELR_SPSR_SIZE);
+    layout->sysregs_offset = append_snapshot_block(&stream_end,
+                                                   A64_CPT_SYSREG_STATE_SIZE);
+
+    if (layout->feature_flags & A64_CPT_FLAG_HAS_FPSIMD) {
+        layout->fpsimd_offset = append_snapshot_block(&stream_end,
+                                                      A64_CPT_FPSIMD_SIZE);
+    }
+    if (layout->feature_flags & A64_CPT_FLAG_HAS_SVE) {
+        uint64_t pred_bytes;
+
+        layout->sve_vl_bytes =
+            (sve_vqm1_for_el_sm(env, arm_current_el(env), false) + 1) * 16;
+        layout->sve_max_vl_bytes = cpu->sve_max_vq * 16;
+        pred_bytes = layout->sve_vl_bytes / 8;
+
+        g_assert(layout->sve_vl_bytes >= 16);
+        g_assert(layout->sve_vl_bytes <= A64_CPT_MAX_SVE_VL_BYTES);
+        g_assert((layout->sve_vl_bytes & 15) == 0);
+        g_assert(layout->sve_max_vl_bytes >= layout->sve_vl_bytes);
+        g_assert(layout->sve_max_vl_bytes <= A64_CPT_MAX_SVE_VL_BYTES);
+
+        layout->sve_zregs_offset = append_snapshot_block(
+            &stream_end, A64_CPT_SVE_ZREG_COUNT * layout->sve_vl_bytes);
+        layout->sve_pregs_offset = append_snapshot_block(
+            &stream_end, A64_CPT_SVE_PREG_COUNT * pred_bytes);
+        layout->sve_ffr_offset = append_snapshot_block(&stream_end,
+                                                       pred_bytes);
+    }
+    if (layout->feature_flags & A64_CPT_FLAG_HAS_PAUTH) {
+        layout->pauth_offset = append_snapshot_block(&stream_end,
+                                                     A64_CPT_PAUTH_SIZE);
+    }
+
+    layout->total_size = ROUND_UP(stream_end, A64_CPT_STREAM_ALIGN);
+    g_assert(layout->total_size <= A64_CPT_RESTORER_RESERVED_SIZE);
+}
+
+static bool tag_memory_has_data(MemoryRegion *mr)
+{
+    const uint8_t *tags;
+    uint64_t size;
+
+    if (!mr) {
+        return false;
+    }
+    if (!memory_region_is_ram(mr)) {
+        return true;
+    }
+
+    tags = memory_region_get_ram_ptr(mr);
+    size = memory_region_size(mr);
+    for (uint64_t i = 0; i < size; i++) {
+        if (tags[i] != 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool checkpoint_state_is_supported(CPUARMState *env)
+{
+    ARMCPU *cpu = env_archcpu(env);
+
+    if (cpu_isar_feature(aa64_sme, cpu)) {
+        if (env->svcr != 0 || env->cp15.tpidr2_el0 != 0 ||
+            env->vfp.smcr_el[1] != 0 || env->vfp.smcr_el[2] != 0 ||
+            env->vfp.smcr_el[3] != 0) {
+            error_report("a64 checkpoint: nonzero SME state is not supported "
+                         "by snapshot version 1");
+            return false;
+        }
+    }
+
+    if (cpu_isar_feature(aa64_mte, cpu)) {
+        if (env->cp15.gcr_el1 != 0 || env->cp15.rgsr_el1 != 0 ||
+            env->cp15.tfsr_el[0] != 0 || env->cp15.tfsr_el[1] != 0 ||
+            env->cp15.tfsr_el[2] != 0 || env->cp15.tfsr_el[3] != 0 ||
+            tag_memory_has_data(cpu->tag_memory) ||
+            tag_memory_has_data(cpu->secure_tag_memory)) {
+            error_report("a64 checkpoint: nonzero MTE state is not supported "
+                         "by snapshot version 1");
+            return false;
+        }
+    }
+
+    if (cpu_isar_feature(aa64_fpmr, cpu) && env->vfp.fpmr != 0) {
+        error_report("a64 checkpoint: nonzero FPMR is not supported by "
+                     "snapshot version 1");
+        return false;
+    }
+    if (cpu_isar_feature(aa64_scxtnum, cpu) &&
+        (env->scxtnum_el[0] != 0 || env->scxtnum_el[1] != 0 ||
+         env->scxtnum_el[2] != 0 || env->scxtnum_el[3] != 0)) {
+        error_report("a64 checkpoint: nonzero SCXTNUM state is not supported "
+                     "by snapshot version 1");
+        return false;
+    }
+    return true;
+}
+
+static void write_snapshot_header(uint8_t *snapshot, CPUARMState *env,
+                                  uint64_t pc,
+                                  const A64SnapshotLayout *layout)
+{
+    uint64_t pstate = pstate_read(env);
+
+    put_u64(snapshot, 0, A64_CPT_SNAPSHOT_MAGIC);
+    put_u64(snapshot, 8, A64_CPT_SNAPSHOT_VERSION);
+    put_u64(snapshot, 16, A64_CPT_SNAPSHOT_HEADER_SIZE);
+    put_u64(snapshot, 24, layout->total_size);
+    put_u64(snapshot, 32, 1);
+    put_u64(snapshot, 40, 0);
+    put_u64(snapshot, 48, layout->feature_flags);
+    put_u64(snapshot, 56, arm_current_el(env));
+    put_u64(snapshot, 64, pc);
+    put_u64(snapshot, 72, pstate);
+    put_u64(snapshot, 80, layout->int_regs_offset);
+    put_u64(snapshot, 88, layout->sp_regs_offset);
+    put_u64(snapshot, 96, layout->elr_spsr_offset);
+    put_u64(snapshot, 104, layout->sysregs_offset);
+    put_u64(snapshot, 112, layout->fpsimd_offset);
+    put_u64(snapshot, 120, layout->sve_zregs_offset);
+    put_u64(snapshot, 128, layout->sve_pregs_offset);
+    put_u64(snapshot, 136, layout->sve_ffr_offset);
+    put_u64(snapshot, 144, layout->sve_vl_bytes);
+    put_u64(snapshot, 152, layout->sve_max_vl_bytes);
+    for (int i = 0; i < 4; i++) {
+        put_u64(snapshot, 160 + i * 8, env->vfp.zcr_el[i]);
+    }
+    put_u64(snapshot, 192, layout->pauth_offset);
+}
+
+static void put_next_u64(uint8_t *snapshot, uint64_t *offset, uint64_t value)
+{
+    put_u64(snapshot, *offset, value);
+    *offset += sizeof(value);
+}
+
+static void write_sysreg_state(uint8_t *snapshot, CPUARMState *env,
+                               uint64_t offset)
+{
+    uint64_t end = offset + A64_CPT_SYSREG_STATE_SIZE;
+
+    put_next_u64(snapshot, &offset, env->cp15.sctlr_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.tcr_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.ttbr0_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.ttbr1_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.mair_el[1]);
+    put_next_u64(snapshot, &offset, 0); /* AMAIR_EL1 is RAZ/WI in QEMU. */
+    put_next_u64(snapshot, &offset, env->cp15.vbar_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.contextidr_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.tpidr_el[0]);
+    put_next_u64(snapshot, &offset, env->cp15.tpidrro_el[0]);
+    put_next_u64(snapshot, &offset, env->cp15.tpidr_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.cpacr_el1);
+    put_next_u64(snapshot, &offset, env->cp15.esr_el[1]);
+    put_next_u64(snapshot, &offset, env->cp15.far_el[1]);
+    put_next_u64(snapshot, &offset, 0); /* AFSR0_EL1 is RAZ/WI. */
+    put_next_u64(snapshot, &offset, 0); /* AFSR1_EL1 is RAZ/WI. */
+    put_next_u64(snapshot, &offset, env->cp15.c14_timer[GTIMER_PHYS].ctl);
+    put_next_u64(snapshot, &offset, env->cp15.c14_timer[GTIMER_PHYS].cval);
+    put_next_u64(snapshot, &offset, env->cp15.c14_timer[GTIMER_VIRT].ctl);
+    put_next_u64(snapshot, &offset, env->cp15.c14_timer[GTIMER_VIRT].cval);
+    put_next_u64(snapshot, &offset, env->cp15.c14_cntfrq);
+    put_next_u64(snapshot, &offset, env->cp15.c14_cntkctl);
+
+    put_next_u64(snapshot, &offset, env->cp15.sctlr_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.tcr_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.ttbr0_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.ttbr1_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.mair_el[2]);
+    put_next_u64(snapshot, &offset, 0); /* AMAIR_EL2 is RAZ/WI. */
+    put_next_u64(snapshot, &offset, env->cp15.vbar_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.tpidr_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.hcr_el2);
+    put_next_u64(snapshot, &offset, env->cp15.cptr_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.cnthctl_el2);
+    put_next_u64(snapshot, &offset, env->cp15.cntvoff_el2);
+    put_next_u64(snapshot, &offset, env->cp15.vtcr_el2);
+    put_next_u64(snapshot, &offset, env->cp15.vttbr_el2);
+    put_next_u64(snapshot, &offset, env->cp15.esr_el[2]);
+    put_next_u64(snapshot, &offset, env->cp15.far_el[2]);
+    put_next_u64(snapshot, &offset, 0); /* AFSR0_EL2 is RAZ/WI. */
+    put_next_u64(snapshot, &offset, 0); /* AFSR1_EL2 is RAZ/WI. */
+
+    put_next_u64(snapshot, &offset, env->cp15.sctlr_el[3]);
+    put_next_u64(snapshot, &offset, env->cp15.scr_el3);
+    put_next_u64(snapshot, &offset, env->cp15.cptr_el[3]);
+    put_next_u64(snapshot, &offset, env->cp15.vbar_el[3]);
+    put_next_u64(snapshot, &offset, env->cp15.tpidr_el[3]);
+    put_next_u64(snapshot, &offset, env->cp15.esr_el[3]);
+    put_next_u64(snapshot, &offset, env->cp15.far_el[3]);
+    put_next_u64(snapshot, &offset, 0); /* AFSR0_EL3 is RAZ/WI. */
+    put_next_u64(snapshot, &offset, 0); /* AFSR1_EL3 is RAZ/WI. */
+
+    g_assert(offset == end);
+}
+
+static void write_sve_state(uint8_t *snapshot, CPUARMState *env,
+                            const A64SnapshotLayout *layout)
+{
+    uint64_t pred_bytes;
+
+    if (!(layout->feature_flags & A64_CPT_FLAG_HAS_SVE)) {
+        return;
+    }
+
+    pred_bytes = layout->sve_vl_bytes / 8;
+    for (unsigned int i = 0; i < A64_CPT_SVE_ZREG_COUNT; i++) {
+        put_le_words(snapshot,
+                     layout->sve_zregs_offset + i * layout->sve_vl_bytes,
+                     env->vfp.zregs[i].d, layout->sve_vl_bytes);
+    }
+    for (unsigned int i = 0; i < A64_CPT_SVE_PREG_COUNT; i++) {
+        put_le_words(snapshot,
+                     layout->sve_pregs_offset + i * pred_bytes,
+                     env->vfp.pregs[i].p, pred_bytes);
+    }
+    put_le_words(snapshot, layout->sve_ffr_offset,
+                 env->vfp.pregs[FFR_PRED_NUM].p, pred_bytes);
+}
+
+static void write_pauth_state(uint8_t *snapshot, CPUARMState *env,
+                              const A64SnapshotLayout *layout)
+{
+    const ARMPACKey *keys[] = {
+        &env->keys.apia,
+        &env->keys.apib,
+        &env->keys.apda,
+        &env->keys.apdb,
+        &env->keys.apga,
     };
 
-    for (uint64_t i = 0; i < ARRAY_SIZE(layout); i++) {
-        put_u64(metadata, 40 + i * 8, layout[i]);
+    if (!(layout->feature_flags & A64_CPT_FLAG_HAS_PAUTH)) {
+        return;
+    }
+
+    for (size_t i = 0; i < ARRAY_SIZE(keys); i++) {
+        put_u64(snapshot, layout->pauth_offset + i * 16, keys[i]->lo);
+        put_u64(snapshot, layout->pauth_offset + i * 16 + 8, keys[i]->hi);
     }
 }
 
-static void add_sysreg(uint8_t *core, uint64_t *count, uint16_t encoding,
-                       uint64_t value)
-{
-    uint64_t off = A64_CPT_OFF_SYSREG + 16 + *count * 16;
-
-    g_assert(*count < A64_CPT_MAX_SYSREG_RECORDS);
-    put_u16(core, off, encoding);
-    put_u16(core, off + 2, A64_CPT_SYSREG_RECORD_F_RESTORE);
-    put_u32(core, off + 4, 0);
-    put_u64(core, off + 8, value);
-    (*count)++;
-}
-
-static uint16_t sysreg_encoding(int op0, int op1, int crn, int crm, int op2)
-{
-    return A64_CPT_SYSREG_ENCODING(op0, op1, crn, crm, op2);
-}
-
-static void write_sysregs(uint8_t *core, CPUARMState *env)
-{
-    uint64_t count = 0;
-
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 1, 0, 0),
-               env->cp15.sctlr_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 2, 0, 2),
-               env->cp15.tcr_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 2, 0, 0),
-               env->cp15.ttbr0_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 2, 0, 1),
-               env->cp15.ttbr1_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 10, 2, 0),
-               env->cp15.mair_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 12, 0, 0),
-               env->cp15.vbar_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 13, 0, 1),
-               env->cp15.contextidr_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 3, 13, 0, 2),
-               env->cp15.tpidr_el[0]);
-    add_sysreg(core, &count, sysreg_encoding(3, 3, 13, 0, 3),
-               env->cp15.tpidrro_el[0]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 13, 0, 4),
-               env->cp15.tpidr_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 1, 0, 2),
-               env->cp15.cpacr_el1);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 5, 2, 0),
-               env->cp15.esr_el[1]);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 6, 0, 0),
-               env->cp15.far_el[1]);
-    add_sysreg(core, &count, A64_CPT_RESTORER_CNTP_CTL_EL0,
-               env->cp15.c14_timer[GTIMER_PHYS].ctl);
-    add_sysreg(core, &count, A64_CPT_RESTORER_CNTP_CVAL_EL0,
-               env->cp15.c14_timer[GTIMER_PHYS].cval);
-    add_sysreg(core, &count, A64_CPT_RESTORER_CNTV_CTL_EL0,
-               env->cp15.c14_timer[GTIMER_VIRT].ctl);
-    add_sysreg(core, &count, A64_CPT_RESTORER_CNTV_CVAL_EL0,
-               env->cp15.c14_timer[GTIMER_VIRT].cval);
-    add_sysreg(core, &count, sysreg_encoding(3, 0, 14, 1, 0),
-               env->cp15.c14_cntkctl);
-
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 1, 0, 0),
-               env->cp15.sctlr_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 2, 0, 2),
-               env->cp15.tcr_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 2, 0, 0),
-               env->cp15.ttbr0_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 10, 2, 0),
-               env->cp15.mair_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 12, 0, 0),
-               env->cp15.vbar_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 13, 0, 2),
-               env->cp15.tpidr_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 1, 1, 0),
-               env->cp15.hcr_el2);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 1, 1, 2),
-               env->cp15.cptr_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 14, 1, 0),
-               env->cp15.cnthctl_el2);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 14, 0, 3),
-               env->cp15.cntvoff_el2);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 2, 1, 2),
-               env->cp15.vtcr_el2);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 2, 1, 0),
-               env->cp15.vttbr_el2);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 5, 2, 0),
-               env->cp15.esr_el[2]);
-    add_sysreg(core, &count, sysreg_encoding(3, 4, 6, 0, 0),
-               env->cp15.far_el[2]);
-
-    add_sysreg(core, &count, sysreg_encoding(3, 6, 1, 0, 0),
-               env->cp15.sctlr_el[3]);
-    add_sysreg(core, &count, sysreg_encoding(3, 6, 1, 1, 0),
-               env->cp15.scr_el3);
-    add_sysreg(core, &count, sysreg_encoding(3, 6, 1, 1, 2),
-               env->cp15.cptr_el[3]);
-    add_sysreg(core, &count, sysreg_encoding(3, 6, 12, 0, 0),
-               env->cp15.vbar_el[3]);
-    add_sysreg(core, &count, sysreg_encoding(3, 6, 13, 0, 2),
-               env->cp15.tpidr_el[3]);
-    add_sysreg(core, &count, sysreg_encoding(3, 6, 5, 2, 0),
-               env->cp15.esr_el[3]);
-    add_sysreg(core, &count, sysreg_encoding(3, 6, 6, 0, 0),
-               env->cp15.far_el[3]);
-
-    put_u64(core, A64_CPT_OFF_SYSREG, count);
-    put_u64(core, A64_CPT_OFF_SYSREG + 8, 0);
-    put_u64(core, A64_CPT_OFF_SYSREG_DONE, 1);
-}
-
-static void write_core_state(uint8_t *core, CPUARMState *env, uint64_t pc)
+static void write_snapshot_state(uint8_t *snapshot, CPUARMState *env,
+                                 uint64_t pc,
+                                 const A64SnapshotLayout *layout)
 {
     uint64_t pstate = pstate_read(env);
     uint64_t sp_el[4];
@@ -577,66 +686,56 @@ static void write_core_state(uint8_t *core, CPUARMState *env, uint64_t pc)
         sp_el[0] = env->xregs[31];
     }
 
-    put_u64(core, A64_CPT_OFF_MAGIC, A64_CPT_CORE_MAGIC_NUMBER);
-    put_u64(core, A64_CPT_OFF_PC, pc);
-    put_u64(core, A64_CPT_OFF_PSTATE, pstate);
-    put_u64(core, A64_CPT_OFF_CURRENT_EL, current_el);
-    put_u64(core, A64_CPT_OFF_FEATURES, A64_CPT_FLAG_HAS_FPSIMD);
-    put_u64(core, A64_CPT_OFF_MISC_DONE, 1);
+    write_snapshot_header(snapshot, env, pc, layout);
 
     for (int i = 0; i < 31; i++) {
-        put_u64(core, A64_CPT_OFF_INT_REG + i * 8, env->xregs[i]);
+        put_u64(snapshot, layout->int_regs_offset + i * 8, env->xregs[i]);
     }
-    put_u64(core, A64_CPT_OFF_INT_DONE, 1);
 
     for (int i = 0; i < 4; i++) {
-        put_u64(core, A64_CPT_OFF_SP_REG + i * 8, sp_el[i]);
+        put_u64(snapshot, layout->sp_regs_offset + i * 8, sp_el[i]);
     }
-    put_u64(core, A64_CPT_OFF_SP_DONE, 1);
 
-    put_u64(core, A64_CPT_OFF_ELR_SPSR, env->elr_el[1]);
-    put_u64(core, A64_CPT_OFF_ELR_SPSR + 8,
+    put_u64(snapshot, layout->elr_spsr_offset, env->elr_el[1]);
+    put_u64(snapshot, layout->elr_spsr_offset + 8,
             env->banked_spsr[aarch64_banked_spsr_index(1)]);
-    put_u64(core, A64_CPT_OFF_ELR_SPSR + 16, env->elr_el[2]);
-    put_u64(core, A64_CPT_OFF_ELR_SPSR + 24,
+    put_u64(snapshot, layout->elr_spsr_offset + 16, env->elr_el[2]);
+    put_u64(snapshot, layout->elr_spsr_offset + 24,
             env->banked_spsr[aarch64_banked_spsr_index(2)]);
-    put_u64(core, A64_CPT_OFF_ELR_SPSR + 32, env->elr_el[3]);
-    put_u64(core, A64_CPT_OFF_ELR_SPSR + 40,
+    put_u64(snapshot, layout->elr_spsr_offset + 32, env->elr_el[3]);
+    put_u64(snapshot, layout->elr_spsr_offset + 40,
             env->banked_spsr[aarch64_banked_spsr_index(3)]);
-    put_u64(core, A64_CPT_OFF_ELR_DONE, 1);
 
-    write_sysregs(core, env);
+    write_sysreg_state(snapshot, env, layout->sysregs_offset);
 
-    put_u64(core, A64_CPT_OFF_IDREG, 0);
-    put_u64(core, A64_CPT_OFF_IDREG + 8, 0);
-    put_u64(core, A64_CPT_OFF_IDREG_DONE, 1);
+    if (layout->feature_flags & A64_CPT_FLAG_HAS_FPSIMD) {
+        for (int i = 0; i < 32; i++) {
+            uint64_t *q = aa64_vfp_qreg(env, i);
 
-    for (int i = 0; i < 32; i++) {
-        uint64_t *q = aa64_vfp_qreg(env, i);
-
-        put_u64(core, A64_CPT_OFF_FLOAT_REG + i * 16, q[0]);
-        put_u64(core, A64_CPT_OFF_FLOAT_REG + i * 16 + 8, q[1]);
+            put_u64(snapshot, layout->fpsimd_offset + i * 16, q[0]);
+            put_u64(snapshot, layout->fpsimd_offset + i * 16 + 8, q[1]);
+        }
+        put_u64(snapshot, layout->fpsimd_offset + 32 * 16,
+                vfp_get_fpsr(env));
+        put_u64(snapshot, layout->fpsimd_offset + 32 * 16 + 8,
+                vfp_get_fpcr(env));
     }
-    put_u64(core, A64_CPT_OFF_FLOAT_REG + 32 * 16, vfp_get_fpsr(env));
-    put_u64(core, A64_CPT_OFF_FLOAT_REG + 32 * 16 + 8, vfp_get_fpcr(env));
-    put_u64(core, A64_CPT_OFF_FLOAT_DONE, 1);
+
+    write_sve_state(snapshot, env, layout);
+    write_pauth_state(snapshot, env, layout);
 }
 
-static void build_metadata(CPUARMState *env, uint64_t pc,
-                           uint8_t **metadata, size_t *metadata_len,
-                           uint8_t **core, size_t *core_len)
+static void build_snapshot(CPUARMState *env, uint64_t pc,
+                           uint8_t **snapshot, size_t *snapshot_len)
 {
-    const uint64_t metadata_size = 40 + 208;
-    const uint64_t cpt_offset = ROUND_UP(metadata_size, A64_CPT_METADATA_ALIGN);
+    A64SnapshotLayout layout;
 
-    *metadata_len = cpt_offset;
-    *core_len = A64_CPT_SINGLE_CORE_SIZE;
-    *metadata = g_malloc0(*metadata_len);
-    *core = g_malloc0(*core_len);
+    build_snapshot_layout(env, &layout);
+    g_assert(layout.total_size <= SIZE_MAX);
+    *snapshot_len = layout.total_size;
+    *snapshot = g_malloc0(*snapshot_len);
 
-    write_checkpoint_header(*metadata);
-    write_checkpoint_layout(*metadata);
-    write_core_state(*core, env, pc);
+    write_snapshot_state(*snapshot, env, pc, &layout);
 }
 
 static char *checkpoint_output_path(const A64CheckpointPoint *point)
@@ -658,33 +757,26 @@ static char *checkpoint_output_path(const A64CheckpointPoint *point)
 static int write_zstd_checkpoint(int fd, CPUARMState *env, uint64_t pc,
                                  const uint8_t *ram, uint64_t ram_size)
 {
-    g_autofree uint8_t *metadata = NULL;
-    g_autofree uint8_t *core = NULL;
+    g_autofree uint8_t *snapshot = NULL;
     g_autofree uint8_t *scratch = g_malloc(A64_CPT_ZSTD_CHUNK_SIZE);
     ZSTD_CCtx *cctx = NULL;
-    A64CheckpointOverlay overlays[2];
-    size_t metadata_len;
-    size_t core_len;
+    A64CheckpointOverlay overlays[1];
+    size_t snapshot_len;
     uint64_t overlay_end;
     size_t zret;
     int ret = 0;
 
-    build_metadata(env, pc, &metadata, &metadata_len, &core, &core_len);
+    build_snapshot(env, pc, &snapshot, &snapshot_len);
     overlays[0] = (A64CheckpointOverlay) {
         .offset = A64_CPT_DEFAULT_HEADER_OFFSET,
-        .data = metadata,
-        .len = metadata_len,
-    };
-    overlays[1] = (A64CheckpointOverlay) {
-        .offset = A64_CPT_DEFAULT_HEADER_OFFSET + metadata_len,
-        .data = core,
-        .len = core_len,
+        .data = snapshot,
+        .len = snapshot_len,
     };
 
-    overlay_end = overlays[1].offset + overlays[1].len;
+    overlay_end = overlays[0].offset + overlays[0].len;
     if (overlay_end > ram_size) {
         error_report("a64 checkpoint: RAM size 0x%" PRIx64
-                     " is smaller than checkpoint metadata end 0x%" PRIx64,
+                     " is smaller than snapshot stream end 0x%" PRIx64,
                      ram_size, overlay_end);
         return -EFBIG;
     }
@@ -748,6 +840,12 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc,
     uint64_t overshoot = actual_insns - point->checkpoint_insns;
     int fd;
     int ret;
+
+    if (!checkpoint_state_is_supported(env)) {
+        a64_cpt.enabled = false;
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
+        return false;
+    }
 
     if (g_mkdir_with_parents(dir, 0775) < 0) {
         error_report("a64 checkpoint: failed to create directory '%s': %s",
