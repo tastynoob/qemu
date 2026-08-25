@@ -30,6 +30,24 @@ checkpoint 只用于 CPU 性能测试，不是 QEMU migration，也不是完整 
 
 这样 guest timer 推进不依赖 host wall clock，有利于保证同一 workload 的 profiling 和 checkpoint 可复现。
 
+``mini-virt`` 平台参数
+======================
+
+``mini-virt`` 默认使用全系统平台 ``fs``：
+
+.. code-block:: shell
+
+  -machine mini-virt,platform=fs
+
+此模式把标准 PL011 UART 映射到 ``0x09000000``。裸机 workload 使用：
+
+.. code-block:: shell
+
+  -machine mini-virt,platform=bm
+
+此模式把同一个 PL011 UART 映射到 ``0x13000000``，向 UART 数据寄存器写入
+数据即可输出。两种模式都保留 GIC 和架构 timer；裸机软件自行忽略它们。
+
 
 Sim Trap 约定
 =============

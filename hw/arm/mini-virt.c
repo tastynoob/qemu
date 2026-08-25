@@ -38,7 +38,8 @@
 #endif
 
 #define MINI_VIRT_RAM_BASE  0x40000000ULL
-#define MINI_VIRT_UART_BASE 0x09000000ULL
+#define MINI_VIRT_FULL_SYSTEM_UART_BASE 0x09000000ULL
+#define MINI_VIRT_BARE_METAL_UART_BASE 0x13000000ULL
 #define MINI_VIRT_GIC_DIST_BASE   0x08000000ULL
 #define MINI_VIRT_GIC_REDIST_BASE 0x080A0000ULL
 #define MINI_VIRT_NUM_SPIS 256
@@ -50,6 +51,7 @@
 typedef struct MiniVirtMachineState {
     MachineState parent_obj;
 
+    char *platform;
     char *checkpoint_mode;
     char *checkpoint_dir;
     char *checkpoint_trigger;
@@ -262,6 +264,7 @@ static void mini_virt_init(MachineState *machine)
     DeviceState *cpudev;
     DeviceState *gicdev;
     ssize_t image_size;
+    hwaddr uart_base;
     Error *local_err = NULL;
 
     memory_region_add_subregion(get_system_memory(), MINI_VIRT_RAM_BASE,
@@ -296,8 +299,10 @@ static void mini_virt_init(MachineState *machine)
     gicdev = mini_virt_create_gic(cpudev);
     object_unref(cpuobj);
 
-    pl011_create(MINI_VIRT_UART_BASE, qdev_get_gpio_in(gicdev,
-                                                       MINI_VIRT_UART_IRQ),
+    uart_base = g_strcmp0(mms->platform, "bm") == 0 ?
+                MINI_VIRT_BARE_METAL_UART_BASE :
+                MINI_VIRT_FULL_SYSTEM_UART_BASE;
+    pl011_create(uart_base, qdev_get_gpio_in(gicdev, MINI_VIRT_UART_IRQ),
                  serial_hd(0));
 
     if (machine->kernel_filename) {
@@ -323,6 +328,20 @@ static void mini_virt_init(MachineState *machine)
             exit(1);
         }
     }
+}
+
+static void mini_virt_set_platform(Object *obj, const char *value,
+                                    Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    if (g_strcmp0(value, "fs") != 0 && g_strcmp0(value, "bm") != 0) {
+        error_setg(errp, "platform must be 'fs' or 'bm'");
+        return;
+    }
+
+    g_free(mms->platform);
+    mms->platform = g_strdup(value);
 }
 
 static void mini_virt_set_checkpoint_mode(Object *obj, const char *value,
@@ -495,6 +514,7 @@ static void mini_virt_instance_init(Object *obj)
 {
     MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
 
+    mms->platform = g_strdup("fs");
     mms->checkpoint_exit_after_last = true;
 }
 
@@ -502,6 +522,7 @@ static void mini_virt_instance_finalize(Object *obj)
 {
     MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
 
+    g_free(mms->platform);
     g_free(mms->checkpoint_mode);
     g_free(mms->checkpoint_dir);
     g_free(mms->checkpoint_trigger);
@@ -527,6 +548,8 @@ static void mini_virt_machine_init(MachineClass *mc)
     mc->no_floppy = 1;
     mc->no_cdrom = 1;
 
+    object_class_property_add_str(oc, "platform", NULL,
+                                  mini_virt_set_platform);
     object_class_property_add_str(oc, "checkpoint-mode", NULL,
                                   mini_virt_set_checkpoint_mode);
     object_class_property_add_str(oc, "checkpoint-dir", NULL,
