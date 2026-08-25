@@ -35,7 +35,7 @@
 static TCGv_i64 cpu_X[32];
 static TCGv_i64 cpu_gcspr[4];
 static TCGv_i64 cpu_pc;
-static TCGv_i64 cpu_profiling_insns;
+static TCGv_i64 cpu_exact_insns;
 
 /* Load/store exclusive handling */
 static TCGv_i64 cpu_exclusive_high;
@@ -95,10 +95,8 @@ void a64_translate_init(void)
     cpu_pc = tcg_global_mem_new_i64(tcg_env,
                                     offsetof(CPUARMState, pc),
                                     "pc");
-    cpu_profiling_insns =
-        tcg_global_mem_new_i64(tcg_env,
-                               offsetof(CPUARMState, profiling_insns),
-                               "profiling_insns");
+    cpu_exact_insns = tcg_global_mem_new_i64(
+        tcg_env, offsetof(CPUARMState, exact_insns), "exact_insns");
     for (i = 0; i < 32; i++) {
         cpu_X[i] = tcg_global_mem_new_i64(tcg_env,
                                           offsetof(CPUARMState, xregs[i]),
@@ -3347,7 +3345,7 @@ static bool trans_HLT(DisasContext *s, arg_i *a)
         if (a->imm == SIMTRAP_DISABLE_TIME_INTR ||
             A64_SIMTRAP_IS_EXIT_SIGNAL(a->imm) ||
             qemu_plugin_a64_simtrap_in_profiling_mode() ||
-            a64_checkpoint_is_enabled()) {
+            a64_checkpoint_is_timed_mode()) {
             gen_helper_a64_simtrap(tcg_env, tcg_constant_i32(a->imm),
                                    tcg_constant_i64(s->pc_curr));
         }
@@ -11063,8 +11061,40 @@ static void aarch64_tr_init_disas_context(DisasContextBase *dcbase,
 
 static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
 {
-    if (a64_checkpoint_has_pending()) {
-        gen_helper_a64_checkpoint(tcg_env, tcg_constant_i64(db->pc_first));
+    DisasContext *dc = container_of(db, DisasContext, base);
+
+    if (a64_checkpoint_is_pc_mode() &&
+        a64_checkpoint_pc_pending(db->pc_first)) {
+        gen_helper_a64_checkpoint_pc(tcg_env,
+                                     tcg_constant_i64(db->pc_first));
+    }
+
+    if (a64_checkpoint_compare_start_pending(db->pc_first)) {
+        gen_helper_a64_checkpoint_compare_start(
+            tcg_env, tcg_constant_i64(db->pc_first));
+    }
+
+    if (a64_checkpoint_is_timed_mode() ||
+        a64_checkpoint_is_compare_mode()) {
+        TCGv_i64 count = tcg_temp_new_i64();
+
+        tcg_gen_ld_i64(count, tcg_env,
+                       offsetof(CPUARMState, profiling_insns));
+        tcg_gen_add_i64(count, count, tcg_constant_i64(1));
+        dc->profiling_count_op = tcg_last_op();
+        tcg_gen_st_i64(count, tcg_env,
+                       offsetof(CPUARMState, profiling_insns));
+        if (a64_checkpoint_is_timed_mode()) {
+            TCGv_i64 next = tcg_temp_new_i64();
+            TCGLabel *fast_path = gen_new_label();
+
+            tcg_gen_ld_i64(next, tcg_env,
+                           offsetof(CPUARMState, checkpoint_next_insns));
+            tcg_gen_brcond_i64(TCG_COND_LTU, count, next, fast_path);
+            gen_helper_a64_checkpoint(tcg_env,
+                                      tcg_constant_i64(db->pc_first));
+            gen_set_label(fast_path);
+        }
     }
 }
 
@@ -11186,6 +11216,14 @@ static void aarch64_tr_tb_stop(DisasContextBase *dcbase, CPUState *cpu)
 {
     DisasContext *dc = container_of(dcbase, DisasContext, base);
 
+    if (dc->profiling_count_op) {
+        tcg_set_insn_param(dc->profiling_count_op, 2,
+                           tcgv_i64_arg(tcg_constant_i64(dc->base.num_insns)));
+    }
+    if (a64_checkpoint_is_compare_mode()) {
+        gen_helper_a64_checkpoint_compare_check(tcg_env);
+    }
+
     if (unlikely(dc->ss_active)) {
         /* Note that this means single stepping WFI doesn't halt the CPU.
          * For conditional branch insns this is harmless unreachable code as
@@ -11258,14 +11296,20 @@ const TranslatorOps aarch64_translator_ops = {
     .insn_start         = aarch64_tr_insn_start,
     .translate_insn     = aarch64_tr_translate_insn,
     .tb_stop            = aarch64_tr_tb_stop,
-    .cpu_exec_count     = &cpu_profiling_insns,
 };
 
 void aarch64_translate_code(CPUState *cpu, TranslationBlock *tb,
                             int *max_insns, vaddr pc, void *host_pc)
 {
-     DisasContext dc = {};
-     translator_loop(cpu, tb, max_insns, pc, host_pc,
-                     &aarch64_translator_ops, &dc.base,
-                     TCG_TYPE_VA);
+    TranslatorOps ops = aarch64_translator_ops;
+    DisasContext dc = {};
+
+    /* Exact counting is a diagnostic-only path and must stay off the
+     * normal profiling/checkpoint fast path. */
+    if (a64_checkpoint_compare_uses_exact()) {
+        ops.exact_insn_count = &cpu_exact_insns;
+    }
+    translator_loop(cpu, tb, max_insns, pc, host_pc,
+                    &ops, &dc.base,
+                    TCG_TYPE_VA);
 }

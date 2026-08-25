@@ -312,12 +312,12 @@ small translated-block overshoot. That overshoot is carried into the next
 interval threshold, matching NEMU's interval-drift accounting, so boundaries
 remain close to ``location * interval`` instead of accumulating drift. An
 individual vector can therefore be slightly longer or shorter than the target.
-Accounting is deferred until the next translated block, an execution
-discontinuity, or the stop simtrap. On AArch64, the plugin uses the target's
-instruction counter delta to settle only the executed portion of a block, so a
-synchronous exception or memory fault cannot pre-account the unexecuted tail.
-Interval decisions remain at translated-block boundaries; simtrap instructions
-retain dedicated callbacks to define the profiling window exactly.
+Each translated block updates its interval and BBV counters with inline TCG
+operations. A conditional callback runs only when the interval threshold is
+reached. Counts are deliberately approximate at translated-block granularity:
+a synchronous exception or memory fault can pre-account the unexecuted tail of
+the current block. Simtrap instructions retain dedicated callbacks to define
+the profiling window.
 
 .. list-table:: SimPoint plugin arguments
   :widths: 20 80
@@ -375,10 +375,25 @@ after ``HLT #0x101`` and ends at the instruction before ``HLT #0x102``.
 For reproducible full-system profiling runs, use deterministic instruction
 counting such as ``-icount shift=0,sleep=off`` so timer-driven guest state does
 not change the profiled instruction stream between runs.
-AArch64 TCG also maintains an internal ``profiling_insns`` counter in CPU state,
-incremented once per translated guest instruction. This provides the exact
-absolute instruction count used by later SimPoint checkpoint slicing; it is
-independent of the guest-visible generic timer.
+AArch64 TCG maintains an internal ``profiling_insns`` counter only while timed
+checkpointing is configured. It is updated at each translated block entry by
+that block's instruction count and is independent of the guest-visible generic
+timer. With mini-virt ``checkpoint-trigger=immediate``, the checkpoint window
+starts at the first translated block entry. The generated TB fast path only
+updates the counter and compares the next threshold; it calls the checkpoint
+helper only after the threshold is reached. Normal execution and PC-triggered
+checkpointing do not contain this counter update.
+
+For comparing the two counting methods, set both mini-virt properties
+``instruction-count-compare-pc=PC`` and
+``instruction-count-compare-limit=N``. The counters are reset when execution
+reaches ``PC`` and QEMU exits after the per-instruction ``exact_insns`` counter
+reaches ``N``. The log fields are ``exact`` (one increment per entered guest
+instruction), ``tb`` (the TB-level ``profiling_insns`` estimate), and
+``delta=tb-exact``. The compare properties are diagnostic only; they do not
+change the checkpoint format or the normal checkpoint scheduling path.
+Set ``instruction-count-compare-counter=tb`` to stop on the TB counter without
+emitting the exact per-instruction update; the default is ``exact``.
 
 Example::
 

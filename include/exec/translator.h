@@ -115,10 +115,11 @@ struct DisasContextBase {
  * @disas_log:
  *      Print instruction disassembly to log.
  *
- * @cpu_exec_count:
+ * @exact_insn_count:
  *      Optional TCG global for a target-maintained executed instruction
  *      counter. When present, the generic translator increments it once for
- *      every guest instruction before translating that instruction.
+ *      every guest instruction before translating that instruction. This is
+ *      distinct from any translated-block (TB) instruction counter.
  *
  */
 typedef struct TranslatorOps {
@@ -128,7 +129,7 @@ typedef struct TranslatorOps {
     void (*translate_insn)(DisasContextBase *db, CPUState *cpu);
     void (*tb_stop)(DisasContextBase *db, CPUState *cpu);
     bool (*disas_log)(const DisasContextBase *db, CPUState *cpu, FILE *f);
-    TCGv_i64 *cpu_exec_count;
+    TCGv_i64 *exact_insn_count;
 } TranslatorOps;
 
 /**

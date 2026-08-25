@@ -1,9 +1,9 @@
 /*
- * AArch64 SimPoint checkpoint support.
+ * AArch64 performance checkpoint support.
  *
- * This writes the raw-memory checkpoint format consumed by
- * libcheckpoint-for-aarch64. The output is a sparse mini-virt RAM image with
- * checkpoint metadata overlaid at gcpt_base + 0x100000.
+ * This writes the zstd-compressed raw-memory checkpoint format consumed by
+ * libcheckpoint-for-aarch64. The writer streams mini-virt RAM directly into
+ * the compressed checkpoint image.
  */
 
 #include "qemu/osdep.h"
@@ -78,6 +78,12 @@ typedef struct A64CheckpointState {
     bool window_started;
     bool exit_after_last;
     bool writing;
+    bool pc_mode;
+    bool pc_taken;
+    bool compare_mode;
+    bool compare_exact;
+    bool compare_started;
+    bool compare_reported;
     uint64_t window_base;
     uint64_t warmup_interval;
     uint64_t ram_base;
@@ -85,11 +91,16 @@ typedef struct A64CheckpointState {
     MemoryRegion *ram;
     char *output_dir;
     GArray *points;
+    GArray *pc_points;
+    uint64_t compare_start_pc;
+    uint64_t compare_limit;
     size_t next_point;
     uint64_t dropped_points;
 } A64CheckpointState;
 
 static A64CheckpointState a64_cpt;
+
+static bool parse_u64_token(const char *token, uint64_t *value, Error **errp);
 
 static void put_u64(void *base, uint64_t off, uint64_t value)
 {
@@ -131,6 +142,41 @@ static void clear_points(void)
         a64_cpt.points = NULL;
     }
     a64_cpt.next_point = 0;
+}
+
+static void clear_pc_points(void)
+{
+    if (a64_cpt.pc_points) {
+        g_array_unref(a64_cpt.pc_points);
+        a64_cpt.pc_points = NULL;
+    }
+    a64_cpt.pc_taken = false;
+}
+
+static bool parse_checkpoint_pcs(const char *pcs, Error **errp)
+{
+    g_auto(GStrv) tokens = NULL;
+
+    if (!pcs || pcs[0] == '\0') {
+        return true;
+    }
+
+    tokens = g_strsplit_set(pcs, ",;: \t\r\n", -1);
+    for (char **p = tokens; *p; p++) {
+        uint64_t value;
+
+        if ((*p)[0] == '\0') {
+            continue;
+        }
+        if (!parse_u64_token(*p, &value, errp)) {
+            return false;
+        }
+        if (!a64_cpt.pc_points) {
+            a64_cpt.pc_points = g_array_new(false, false, sizeof(value));
+        }
+        g_array_append_val(a64_cpt.pc_points, value);
+    }
+    return true;
 }
 
 static void add_point(uint64_t measure_insns)
@@ -753,6 +799,12 @@ static char *checkpoint_output_path(const A64CheckpointPoint *point)
                            point->checkpoint_insns);
 }
 
+static char *checkpoint_pc_output_path(uint64_t pc)
+{
+    return g_strdup_printf("%s/_0x%" PRIx64 "_.bin.zst",
+                           a64_cpt.output_dir, pc);
+}
+
 #ifdef CONFIG_ZSTD
 static int write_zstd_checkpoint(int fd, CPUARMState *env, uint64_t pc,
                                  const uint8_t *ram, uint64_t ram_size)
@@ -875,6 +927,7 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc,
     if (ret < 0) {
         error_report("a64 checkpoint: failed to write '%s': %s",
                      path, g_strerror(-ret));
+        unlink(path);
         return false;
     }
 
@@ -888,26 +941,86 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc,
 #endif
 }
 
+static bool dump_pc_checkpoint(CPUARMState *env, uint64_t pc)
+{
+    g_autofree char *path = checkpoint_pc_output_path(pc);
+    uint8_t *ram_ptr = memory_region_get_ram_ptr(a64_cpt.ram);
+    int fd;
+    int ret;
+
+    if (!checkpoint_state_is_supported(env)) {
+        return false;
+    }
+    if (g_mkdir_with_parents(a64_cpt.output_dir, 0775) < 0) {
+        error_report("a64 checkpoint: failed to create directory '%s': %s",
+                     a64_cpt.output_dir, g_strerror(errno));
+        return false;
+    }
+    fd = open(path, O_CREAT | O_TRUNC | O_WRONLY | O_BINARY, 0664);
+    if (fd < 0) {
+        error_report("a64 checkpoint: failed to open '%s': %s",
+                     path, g_strerror(errno));
+        return false;
+    }
+#ifndef CONFIG_ZSTD
+    error_report("a64 checkpoint: zstd support is not available; "
+                 "reconfigure QEMU with --enable-zstd");
+    close(fd);
+    unlink(path);
+    return false;
+#else
+    ret = write_zstd_checkpoint(fd, env, pc, ram_ptr, a64_cpt.ram_size);
+    if (close(fd) < 0 && ret == 0) {
+        ret = -errno;
+    }
+    if (ret < 0) {
+        error_report("a64 checkpoint: failed to write '%s': %s",
+                     path, g_strerror(-ret));
+        unlink(path);
+        return false;
+    }
+    info_report("a64 checkpoint: wrote PC checkpoint %s pc=0x%" PRIx64,
+                path, pc);
+    return true;
+#endif
+}
+
 void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
                               uint64_t ram_size, const char *mode,
                               const char *output_dir,
                               const char *cutpoints,
+                              const char *checkpoint_pcs,
                               const char *cutpoints_file,
                               const char *simpoint_path,
                               const char *simpoint_file,
                               uint64_t cpt_interval,
                               uint64_t warmup_interval,
+                              const char *trigger,
+                              uint64_t compare_start_pc,
+                              uint64_t compare_limit,
+                              const char *compare_counter,
                               bool exit_after_last,
                               Error **errp)
 {
     bool enabled;
+    bool immediate_trigger;
+    bool compare_exact;
 
-    enabled = mode && (g_strcmp0(mode, "SimpointCheckpoint") == 0 ||
-                       g_strcmp0(mode, "simpoint") == 0 ||
-                       g_strcmp0(mode, "checkpoint") == 0);
+    enabled = mode &&
+              (g_strcmp0(mode, "SimpointCheckpoint") == 0 ||
+               g_strcmp0(mode, "simpoint") == 0 ||
+               g_strcmp0(mode, "checkpoint") == 0);
     if (!enabled) {
         a64_cpt.enabled = false;
         clear_points();
+        clear_pc_points();
+        return;
+    }
+
+    immediate_trigger = g_strcmp0(trigger, "immediate") == 0;
+    if (trigger && trigger[0] != '\0' && !immediate_trigger &&
+        g_strcmp0(trigger, "simtrap") != 0) {
+        error_setg(errp, "checkpoint trigger must be 'immediate' or 'simtrap'");
         return;
     }
 
@@ -916,7 +1029,19 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
         return;
     }
 
+    if (!compare_counter || compare_counter[0] == '\0' ||
+        g_strcmp0(compare_counter, "exact") == 0) {
+        compare_exact = true;
+    } else if (g_strcmp0(compare_counter, "tb") == 0) {
+        compare_exact = false;
+    } else {
+        error_setg(errp,
+                   "instruction-count-compare-counter must be 'exact' or 'tb'");
+        return;
+    }
+
     clear_points();
+    clear_pc_points();
     g_free(a64_cpt.output_dir);
     a64_cpt.output_dir = g_strdup(output_dir && output_dir[0] != '\0' ?
                                   output_dir : "a64-checkpoints");
@@ -925,12 +1050,20 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
     a64_cpt.ram_size = ram_size;
     a64_cpt.warmup_interval = warmup_interval;
     a64_cpt.exit_after_last = exit_after_last;
-    a64_cpt.window_started = false;
+    a64_cpt.window_started = immediate_trigger;
     a64_cpt.window_base = 0;
     a64_cpt.writing = false;
     a64_cpt.dropped_points = 0;
+    a64_cpt.pc_mode = checkpoint_pcs && checkpoint_pcs[0] != '\0';
+    a64_cpt.compare_start_pc = compare_start_pc;
+    a64_cpt.compare_limit = compare_limit;
+    a64_cpt.compare_mode = compare_start_pc != 0 && compare_limit != 0;
+    a64_cpt.compare_exact = compare_exact;
+    a64_cpt.compare_started = false;
+    a64_cpt.compare_reported = false;
 
-    if (!parse_cutpoints_string(cutpoints, errp) ||
+    if (!parse_checkpoint_pcs(checkpoint_pcs, errp) ||
+        !parse_cutpoints_string(cutpoints, errp) ||
         !parse_cutpoints_file(cutpoints_file, false, cpt_interval, errp) ||
         !parse_simpoint_path(simpoint_path, simpoint_file, cpt_interval, errp)) {
         a64_cpt.enabled = false;
@@ -939,28 +1072,89 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
     }
 
     sort_and_dedupe_points();
-    if (!a64_cpt.points || a64_cpt.points->len == 0) {
+    if ((!a64_cpt.points || a64_cpt.points->len == 0) &&
+        (!a64_cpt.pc_points || a64_cpt.pc_points->len == 0) &&
+        !a64_cpt.compare_mode) {
         error_setg(errp, "checkpoint mode requires at least one cutpoint");
         a64_cpt.enabled = false;
         return;
     }
 
     a64_cpt.enabled = true;
-    info_report("a64 checkpoint: enabled with %u cutpoint(s), output '%s', "
-                "warmup %" PRIu64 ", dropped %" PRIu64,
-                a64_cpt.points->len, a64_cpt.output_dir,
-                a64_cpt.warmup_interval, a64_cpt.dropped_points);
+    info_report("a64 checkpoint: enabled with %u cutpoint(s), %u PC point(s), output '%s', "
+                "warmup %" PRIu64 ", trigger %s, dropped %" PRIu64,
+                a64_cpt.points ? a64_cpt.points->len : 0,
+                a64_cpt.pc_points ? a64_cpt.pc_points->len : 0,
+                a64_cpt.output_dir,
+                a64_cpt.warmup_interval,
+                immediate_trigger ? "immediate" : "simtrap",
+                a64_cpt.dropped_points);
 }
 
-bool a64_checkpoint_is_enabled(void)
+bool a64_checkpoint_is_timed_mode(void)
 {
-    return a64_cpt.enabled;
+    return a64_cpt.enabled && !a64_cpt.pc_mode && !a64_cpt.compare_mode;
 }
 
-bool a64_checkpoint_has_pending(void)
+bool a64_checkpoint_is_compare_mode(void)
+{
+    return a64_cpt.enabled && a64_cpt.compare_mode;
+}
+
+bool a64_checkpoint_compare_uses_exact(void)
+{
+    return a64_checkpoint_is_compare_mode() && a64_cpt.compare_exact;
+}
+
+bool a64_checkpoint_compare_start_pending(uint64_t pc)
+{
+    return a64_checkpoint_is_compare_mode() &&
+           !a64_cpt.compare_started && pc == a64_cpt.compare_start_pc;
+}
+
+bool a64_checkpoint_is_pc_mode(void)
+{
+    return a64_cpt.enabled && a64_cpt.pc_mode;
+}
+
+bool a64_checkpoint_pc_pending(uint64_t pc)
+{
+    if (!a64_checkpoint_is_pc_mode() || a64_cpt.pc_taken ||
+        !a64_cpt.pc_points) {
+        return false;
+    }
+    for (guint i = 0; i < a64_cpt.pc_points->len; i++) {
+        if (g_array_index(a64_cpt.pc_points, uint64_t, i) == pc) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool a64_checkpoint_has_pending(void)
 {
     return a64_cpt.enabled && a64_cpt.points &&
            a64_cpt.next_point < a64_cpt.points->len;
+}
+
+static void a64_checkpoint_update_next(CPUARMState *env)
+{
+    env->checkpoint_next_insns = UINT64_MAX;
+    if (a64_checkpoint_is_timed_mode() && a64_cpt.window_started &&
+        a64_checkpoint_has_pending()) {
+        A64CheckpointPoint *point =
+            &g_array_index(a64_cpt.points, A64CheckpointPoint,
+                           a64_cpt.next_point);
+
+        env->checkpoint_next_insns =
+            a64_cpt.window_base + point->checkpoint_insns;
+    }
+}
+
+void a64_checkpoint_cpu_init(CPUARMState *env)
+{
+    env->checkpoint_next_insns = UINT64_MAX;
+    a64_checkpoint_update_next(env);
 }
 
 static void a64_checkpoint_try_take_at(CPUARMState *env, uint64_t pc,
@@ -983,7 +1177,8 @@ static void a64_checkpoint_try_take_at(CPUARMState *env, uint64_t pc,
         if (rel_insns < point->checkpoint_insns) {
             break;
         }
-        if (rel_insns > point->measure_insns) {
+        if (point->warmup_insns != 0 &&
+            rel_insns > point->measure_insns) {
             uint64_t overshoot = rel_insns - point->checkpoint_insns;
             uint64_t late = rel_insns - point->measure_insns;
 
@@ -1002,10 +1197,13 @@ static void a64_checkpoint_try_take_at(CPUARMState *env, uint64_t pc,
         if (dump_checkpoint(env, pc, rel_insns, point)) {
             a64_cpt.next_point++;
         } else {
+            a64_cpt.enabled = false;
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
             break;
         }
     }
     a64_cpt.writing = false;
+    a64_checkpoint_update_next(env);
 
     if (!a64_checkpoint_has_pending() && a64_cpt.exit_after_last) {
         qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
@@ -1014,13 +1212,14 @@ static void a64_checkpoint_try_take_at(CPUARMState *env, uint64_t pc,
 
 void a64_checkpoint_notify_profiler(CPUARMState *env, bool start, uint64_t pc)
 {
-    if (!a64_cpt.enabled) {
+    if (!a64_checkpoint_is_timed_mode()) {
         return;
     }
 
     if (start) {
         a64_cpt.window_base = env->profiling_insns;
         a64_cpt.window_started = true;
+        a64_checkpoint_update_next(env);
         info_report("a64 checkpoint: profiling window started at absolute "
                     "instruction %" PRIu64, a64_cpt.window_base);
     } else {
@@ -1028,6 +1227,7 @@ void a64_checkpoint_notify_profiler(CPUARMState *env, bool start, uint64_t pc)
             a64_checkpoint_try_take_at(env, pc, env->profiling_insns - 1);
         }
         a64_cpt.window_started = false;
+        a64_checkpoint_update_next(env);
         info_report("a64 checkpoint: profiling window stopped at absolute "
                     "instruction %" PRIu64, env->profiling_insns);
     }
@@ -1036,4 +1236,54 @@ void a64_checkpoint_notify_profiler(CPUARMState *env, bool start, uint64_t pc)
 void a64_checkpoint_try_take(CPUARMState *env, uint64_t pc)
 {
     a64_checkpoint_try_take_at(env, pc, env->profiling_insns);
+}
+
+void a64_checkpoint_try_take_pc(CPUARMState *env, uint64_t pc)
+{
+    if (!a64_checkpoint_pc_pending(pc) || a64_cpt.writing) {
+        return;
+    }
+    a64_cpt.writing = true;
+    if (dump_pc_checkpoint(env, pc)) {
+        a64_cpt.pc_taken = true;
+    } else {
+        a64_cpt.enabled = false;
+    }
+    a64_cpt.writing = false;
+    if (a64_cpt.pc_taken && a64_cpt.exit_after_last) {
+        qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
+    }
+}
+
+void a64_checkpoint_compare_start(CPUARMState *env, uint64_t pc)
+{
+    if (!a64_checkpoint_compare_start_pending(pc)) {
+        return;
+    }
+    env->profiling_insns = 0;
+    if (a64_cpt.compare_exact) {
+        env->exact_insns = 0;
+    }
+    a64_cpt.compare_started = true;
+    info_report("a64 checkpoint compare: started at pc=0x%" PRIx64,
+                pc);
+}
+
+void a64_checkpoint_compare_check(CPUARMState *env)
+{
+    uint64_t exact = env->exact_insns;
+    uint64_t tb_count = env->profiling_insns;
+    uint64_t selected = a64_cpt.compare_exact ? exact : tb_count;
+
+    if (!a64_checkpoint_is_compare_mode() || !a64_cpt.compare_started ||
+        a64_cpt.compare_reported || selected < a64_cpt.compare_limit) {
+        return;
+    }
+    a64_cpt.compare_reported = true;
+    info_report("a64 checkpoint compare: exact=%" PRIu64
+                " tb=%" PRIu64 " delta=%" PRId64
+                " limit=%" PRIu64,
+                exact, tb_count, (int64_t)tb_count - (int64_t)exact,
+                a64_cpt.compare_limit);
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP_QUIT);
 }

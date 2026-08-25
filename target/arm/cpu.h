@@ -295,7 +295,11 @@ typedef struct CPUArchState {
     uint64_t daif; /* exception masks, in the bits they are in PSTATE */
     uint64_t simtrap_saved_daif;
     bool simtrap_daif_masked;
+    /* Fuzzy TB counter: adds each translated block's static instruction count. */
     uint64_t profiling_insns;
+    /* Exact executed-instruction counter used for compare-mode diagnostics. */
+    uint64_t exact_insns;
+    uint64_t checkpoint_next_insns;
     uint64_t svcr; /* PSTATE.{SM,ZA} in the bits they are in SVCR */
 
     uint64_t elr_el[4]; /* AArch64 exception link regs  */

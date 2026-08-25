@@ -40,6 +40,7 @@ typedef struct DisasContext {
     DisasContextBase base;
     const ARMISARegisters *isar;
     DisasDelayException *delay_excp_list;
+    TCGOp *profiling_count_op;
 
     /* The address of the current instruction being translated. */
     vaddr pc_curr;

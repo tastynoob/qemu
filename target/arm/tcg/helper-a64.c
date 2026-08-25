@@ -176,6 +176,21 @@ void HELPER(a64_checkpoint)(CPUARMState *env, uint64_t pc)
     a64_checkpoint_try_take(env, pc);
 }
 
+void HELPER(a64_checkpoint_pc)(CPUARMState *env, uint64_t pc)
+{
+    a64_checkpoint_try_take_pc(env, pc);
+}
+
+void HELPER(a64_checkpoint_compare_start)(CPUARMState *env, uint64_t pc)
+{
+    a64_checkpoint_compare_start(env, pc);
+}
+
+void HELPER(a64_checkpoint_compare_check)(CPUARMState *env)
+{
+    a64_checkpoint_compare_check(env);
+}
+
 /* Convert a softfloat float_relation_ (as returned by
  * the float*_compare functions) to the correct ARM
  * NZCV flag state.

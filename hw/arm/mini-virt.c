@@ -52,12 +52,17 @@ typedef struct MiniVirtMachineState {
 
     char *checkpoint_mode;
     char *checkpoint_dir;
+    char *checkpoint_trigger;
     char *cutpoints;
+    char *checkpoint_pcs;
     char *cutpoints_file;
     char *simpoint_path;
     char *simpoint_file;
     uint64_t cpt_interval;
     uint64_t warmup_interval;
+    uint64_t compare_start_pc;
+    uint64_t compare_limit;
+    char *compare_counter;
     bool checkpoint_exit_after_last;
 } MiniVirtMachineState;
 
@@ -71,6 +76,23 @@ static bool mini_virt_payload_is_zstd(const char *filename)
 }
 
 #ifdef CONFIG_ZSTD
+static void mini_virt_copy_nonzero_pages(uint8_t *dst, const uint8_t *src,
+                                         size_t size)
+{
+    const size_t page_size = qemu_real_host_page_size();
+    size_t offset = 0;
+
+    while (offset < size) {
+        size_t page_offset = (uintptr_t)(dst + offset) % page_size;
+        size_t length = MIN(page_size - page_offset, size - offset);
+
+        if (!buffer_is_zero(src + offset, length)) {
+            memcpy(dst + offset, src + offset, length);
+        }
+        offset += length;
+    }
+}
+
 static ssize_t mini_virt_load_zstd_payload(const char *filename,
                                            MemoryRegion *ram,
                                            uint64_t max_sz,
@@ -144,7 +166,8 @@ static ssize_t mini_virt_load_zstd_payload(const char *filename,
                     return -1;
                 }
 
-                memcpy(ram_ptr + loaded, outbuf, output.pos);
+                mini_virt_copy_nonzero_pages(ram_ptr + loaded, outbuf,
+                                             output.pos);
                 loaded += output.pos;
             }
         }
@@ -246,9 +269,14 @@ static void mini_virt_init(MachineState *machine)
     a64_checkpoint_configure(machine->ram, MINI_VIRT_RAM_BASE,
                              machine->ram_size, mms->checkpoint_mode,
                              mms->checkpoint_dir, mms->cutpoints,
+                             mms->checkpoint_pcs,
                              mms->cutpoints_file, mms->simpoint_path,
                              mms->simpoint_file, mms->cpt_interval,
                              mms->warmup_interval,
+                             mms->checkpoint_trigger,
+                             mms->compare_start_pc,
+                             mms->compare_limit,
+                             mms->compare_counter,
                              mms->checkpoint_exit_after_last, &local_err);
     if (local_err) {
         error_reportf_err(local_err, "mini-virt checkpoint setup failed: ");
@@ -264,6 +292,7 @@ static void mini_virt_init(MachineState *machine)
                              &error_abort);
     cpudev = DEVICE(cpuobj);
     qdev_realize(cpudev, NULL, &error_fatal);
+    a64_checkpoint_cpu_init(&ARM_CPU(cpuobj)->env);
     gicdev = mini_virt_create_gic(cpudev);
     object_unref(cpuobj);
 
@@ -314,6 +343,15 @@ static void mini_virt_set_checkpoint_dir(Object *obj, const char *value,
     mms->checkpoint_dir = g_strdup(value);
 }
 
+static void mini_virt_set_checkpoint_trigger(Object *obj, const char *value,
+                                             Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->checkpoint_trigger);
+    mms->checkpoint_trigger = g_strdup(value);
+}
+
 static void mini_virt_set_cutpoints(Object *obj, const char *value,
                                     Error **errp)
 {
@@ -321,6 +359,15 @@ static void mini_virt_set_cutpoints(Object *obj, const char *value,
 
     g_free(mms->cutpoints);
     mms->cutpoints = g_strdup(value);
+}
+
+static void mini_virt_set_checkpoint_pcs(Object *obj, const char *value,
+                                         Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->checkpoint_pcs);
+    mms->checkpoint_pcs = g_strdup(value);
 }
 
 static void mini_virt_set_cutpoints_file(Object *obj, const char *value,
@@ -380,6 +427,45 @@ static void mini_virt_set_warmup_interval(Object *obj, const char *value,
     mms->warmup_interval = interval;
 }
 
+static void mini_virt_set_compare_start_pc(Object *obj, const char *value,
+                                            Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+    const char *endp = NULL;
+    uint64_t pc;
+
+    if (qemu_strtou64(value, &endp, 0, &pc) < 0 ||
+        (endp && *endp != '\0')) {
+        error_setg(errp, "invalid instruction-count-compare-pc '%s'", value);
+        return;
+    }
+    mms->compare_start_pc = pc;
+}
+
+static void mini_virt_set_compare_limit(Object *obj, const char *value,
+                                        Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+    const char *endp = NULL;
+    uint64_t limit;
+
+    if (qemu_strtou64(value, &endp, 0, &limit) < 0 ||
+        (endp && *endp != '\0')) {
+        error_setg(errp, "invalid instruction-count-compare-limit '%s'", value);
+        return;
+    }
+    mms->compare_limit = limit;
+}
+
+static void mini_virt_set_compare_counter(Object *obj, const char *value,
+                                           Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    g_free(mms->compare_counter);
+    mms->compare_counter = g_strdup(value);
+}
+
 static void mini_virt_get_checkpoint_exit_after_last(Object *obj, Visitor *v,
                                                      const char *name,
                                                      void *opaque,
@@ -418,10 +504,13 @@ static void mini_virt_instance_finalize(Object *obj)
 
     g_free(mms->checkpoint_mode);
     g_free(mms->checkpoint_dir);
+    g_free(mms->checkpoint_trigger);
     g_free(mms->cutpoints);
+    g_free(mms->checkpoint_pcs);
     g_free(mms->cutpoints_file);
     g_free(mms->simpoint_path);
     g_free(mms->simpoint_file);
+    g_free(mms->compare_counter);
 }
 
 static void mini_virt_machine_init(MachineClass *mc)
@@ -442,8 +531,12 @@ static void mini_virt_machine_init(MachineClass *mc)
                                   mini_virt_set_checkpoint_mode);
     object_class_property_add_str(oc, "checkpoint-dir", NULL,
                                   mini_virt_set_checkpoint_dir);
+    object_class_property_add_str(oc, "checkpoint-trigger", NULL,
+                                  mini_virt_set_checkpoint_trigger);
     object_class_property_add_str(oc, "cutpoints", NULL,
                                   mini_virt_set_cutpoints);
+    object_class_property_add_str(oc, "checkpoint-pcs", NULL,
+                                  mini_virt_set_checkpoint_pcs);
     object_class_property_add_str(oc, "cutpoints-file", NULL,
                                   mini_virt_set_cutpoints_file);
     object_class_property_add_str(oc, "simpoint-path", NULL,
@@ -454,6 +547,12 @@ static void mini_virt_machine_init(MachineClass *mc)
                                   mini_virt_set_cpt_interval);
     object_class_property_add_str(oc, "warmup-interval", NULL,
                                   mini_virt_set_warmup_interval);
+    object_class_property_add_str(oc, "instruction-count-compare-pc", NULL,
+                                  mini_virt_set_compare_start_pc);
+    object_class_property_add_str(oc, "instruction-count-compare-limit", NULL,
+                                  mini_virt_set_compare_limit);
+    object_class_property_add_str(oc, "instruction-count-compare-counter", NULL,
+                                  mini_virt_set_compare_counter);
     object_class_property_add(oc, "checkpoint-exit-after-last", "bool",
                               mini_virt_get_checkpoint_exit_after_last,
                               mini_virt_set_checkpoint_exit_after_last,

@@ -169,15 +169,17 @@ void translator_loop(CPUState *cpu, TranslationBlock *tb, int *max_insns,
             plugin_gen_insn_start(cpu, db);
         }
 
+        if (ops->exact_insn_count) {
+            tcg_gen_addi_i64(*ops->exact_insn_count,
+                             *ops->exact_insn_count, 1);
+        }
+
         /*
          * Disassemble one instruction.  The translate_insn hook should
          * update db->pc_next and db->is_jmp to indicate what should be
          * done next -- either exiting this loop or locate the start of
          * the next instruction.
          */
-        if (ops->cpu_exec_count) {
-            tcg_gen_addi_i64(*ops->cpu_exec_count, *ops->cpu_exec_count, 1);
-        }
         ops->translate_insn(db, cpu);
 
         /*
