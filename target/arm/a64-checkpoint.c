@@ -38,6 +38,7 @@
 #define A64_CPT_SVE_ZREG_COUNT 32U
 #define A64_CPT_SVE_PREG_COUNT 16U
 #define A64_CPT_MAX_SVE_VL_BYTES 256U
+#define A64_CPT_SIMPOINT_WEIGHT_MAX 64U
 #define A64_CPT_INT_REGS_SIZE (31U * sizeof(uint64_t))
 #define A64_CPT_SP_REGS_SIZE (4U * sizeof(uint64_t))
 #define A64_CPT_ELR_SPSR_SIZE (6U * sizeof(uint64_t))
@@ -49,6 +50,10 @@ typedef struct A64CheckpointPoint {
     uint64_t measure_insns;
     uint64_t checkpoint_insns;
     uint64_t warmup_insns;
+    bool has_simpoint;
+    uint64_t simpoint_location;
+    uint64_t simpoint_id;
+    char simpoint_weight[A64_CPT_SIMPOINT_WEIGHT_MAX];
 } A64CheckpointPoint;
 
 typedef struct A64CheckpointOverlay {
@@ -182,10 +187,14 @@ static bool parse_checkpoint_pcs(const char *pcs, Error **errp)
     return true;
 }
 
-static void add_point(uint64_t measure_insns)
+static void add_point(uint64_t measure_insns, bool has_simpoint,
+                      uint64_t simpoint_location, uint64_t simpoint_id)
 {
     A64CheckpointPoint point = {
         .measure_insns = measure_insns,
+        .has_simpoint = has_simpoint,
+        .simpoint_location = simpoint_location,
+        .simpoint_id = simpoint_id,
     };
 
     if (measure_insns >= a64_cpt.warmup_interval) {
@@ -269,7 +278,7 @@ static bool parse_cutpoints_string(const char *cutpoints, Error **errp)
         if (!parse_u64_token(*p, &value, errp)) {
             return false;
         }
-        add_point(value);
+        add_point(value, false, 0, 0);
     }
     return true;
 }
@@ -296,6 +305,9 @@ static bool parse_cutpoints_file(const char *path, bool simpoint_locations,
         g_auto(GStrv) fields = NULL;
         char *line = g_strstrip(*linep);
         uint64_t value;
+        uint64_t simpoint_location = 0;
+        uint64_t simpoint_id = 0;
+        guint metadata_index = 1;
 
         if (line[0] == '\0' || line[0] == '#') {
             continue;
@@ -309,6 +321,20 @@ static bool parse_cutpoints_file(const char *path, bool simpoint_locations,
             return false;
         }
         if (simpoint_locations) {
+            while (fields[metadata_index] &&
+                   fields[metadata_index][0] == '\0') {
+                metadata_index++;
+            }
+            if (!fields[metadata_index]) {
+                error_setg(errp,
+                           "simpoint record '%s' must contain a numeric id",
+                           line);
+                return false;
+            }
+            if (!parse_u64_token(fields[metadata_index], &simpoint_id, errp)) {
+                return false;
+            }
+            simpoint_location = value;
             if (cpt_interval == 0) {
                 error_setg(errp,
                            "cpt-interval must be non-zero for simpoint files");
@@ -321,7 +347,108 @@ static bool parse_cutpoints_file(const char *path, bool simpoint_locations,
             }
             value *= cpt_interval;
         }
-        add_point(value);
+        add_point(value, simpoint_locations, simpoint_location, simpoint_id);
+    }
+    return true;
+}
+
+static bool valid_simpoint_weight(const char *weight)
+{
+    if (!weight || weight[0] == '\0' ||
+        strlen(weight) >= A64_CPT_SIMPOINT_WEIGHT_MAX) {
+        return false;
+    }
+
+    for (const char *p = weight; *p; p++) {
+        if (!g_ascii_isdigit(*p) && *p != '.' && *p != 'e' && *p != 'E' &&
+            *p != '+' && *p != '-') {
+            return false;
+        }
+    }
+    return true;
+}
+
+static bool load_simpoint_weights(const char *path, Error **errp)
+{
+    g_autoptr(GError) gerr = NULL;
+    g_autofree char *contents = NULL;
+    g_auto(GStrv) lines = NULL;
+    size_t len;
+
+    if (!path || path[0] == '\0') {
+        return true;
+    }
+    if (!g_file_get_contents(path, &contents, &len, &gerr)) {
+        error_setg(errp, "failed to read SimPoint weights file '%s': %s",
+                   path, gerr->message);
+        return false;
+    }
+
+    lines = g_strsplit(contents, "\n", -1);
+    for (char **linep = lines; *linep; linep++) {
+        g_auto(GStrv) fields = NULL;
+        char *line = g_strstrip(*linep);
+        uint64_t simpoint_id;
+        guint id_index = 1;
+        bool matched = false;
+
+        if (line[0] == '\0' || line[0] == '#') {
+            continue;
+        }
+
+        fields = g_strsplit_set(line, " \t\r", 0);
+        if (!fields[0] || fields[0][0] == '\0') {
+            continue;
+        }
+        while (fields[id_index] && fields[id_index][0] == '\0') {
+            id_index++;
+        }
+        if (!fields[id_index] || !valid_simpoint_weight(fields[0])) {
+            error_setg(errp, "invalid SimPoint weight record '%s'", line);
+            return false;
+        }
+        if (!parse_u64_token(fields[id_index], &simpoint_id, errp)) {
+            return false;
+        }
+
+        if (a64_cpt.points) {
+            for (guint i = 0; i < a64_cpt.points->len; i++) {
+                A64CheckpointPoint *point =
+                    &g_array_index(a64_cpt.points, A64CheckpointPoint, i);
+
+                if (!point->has_simpoint ||
+                    point->simpoint_id != simpoint_id) {
+                    continue;
+                }
+                if (point->simpoint_weight[0] != '\0') {
+                    error_setg(errp, "duplicate SimPoint weight for id %" PRIu64,
+                               simpoint_id);
+                    return false;
+                }
+                g_strlcpy(point->simpoint_weight, fields[0],
+                          sizeof(point->simpoint_weight));
+                matched = true;
+            }
+        }
+
+        if (!matched) {
+            info_report("a64 checkpoint: ignoring weight for unused SimPoint id "
+                        "%" PRIu64, simpoint_id);
+        }
+    }
+
+    if (a64_cpt.points) {
+        for (guint i = 0; i < a64_cpt.points->len; i++) {
+            A64CheckpointPoint *point =
+                &g_array_index(a64_cpt.points, A64CheckpointPoint, i);
+
+            if (point->has_simpoint && point->simpoint_weight[0] == '\0') {
+                error_setg(errp,
+                           "missing SimPoint weight for location %" PRIu64,
+                           point->simpoint_location);
+                return false;
+            }
+        }
     }
     return true;
 }
@@ -332,6 +459,7 @@ static bool parse_simpoint_path(const char *simpoint_path,
                                 Error **errp)
 {
     g_autofree char *path = NULL;
+    g_autofree char *weights_path = NULL;
 
     if (simpoint_file && simpoint_file[0] != '\0') {
         return parse_cutpoints_file(simpoint_file, true, cpt_interval, errp);
@@ -343,10 +471,21 @@ static bool parse_simpoint_path(const char *simpoint_path,
 
     if (g_file_test(simpoint_path, G_FILE_TEST_IS_DIR)) {
         path = g_build_filename(simpoint_path, "simpoints0", NULL);
+        weights_path = g_build_filename(simpoint_path, "weights0", NULL);
+        if (!g_file_test(weights_path, G_FILE_TEST_IS_REGULAR)) {
+            error_setg(errp, "SimPoint directory is missing weights0: %s",
+                       weights_path);
+            return false;
+        }
     } else {
         path = g_strdup(simpoint_path);
     }
-    return parse_cutpoints_file(path, true, cpt_interval, errp);
+
+    if (!parse_cutpoints_file(path, true, cpt_interval, errp)) {
+        return false;
+    }
+
+    return weights_path ? load_simpoint_weights(weights_path, errp) : true;
 }
 
 #ifdef CONFIG_ZSTD
@@ -789,6 +928,17 @@ static void build_snapshot(CPUARMState *env, uint64_t pc,
 
 static char *checkpoint_output_path(const A64CheckpointPoint *point)
 {
+    if (point->has_simpoint) {
+        if (point->simpoint_weight[0] == '\0') {
+            error_report("a64 checkpoint: SimPoint location %" PRIu64
+                         " has no weight", point->simpoint_location);
+            return NULL;
+        }
+        return g_strdup_printf("%s/%" PRIu64 "_%s.zstd",
+                               a64_cpt.output_dir, point->simpoint_location,
+                               point->simpoint_weight);
+    }
+
     if (a64_cpt.warmup_interval == 0) {
         return g_strdup_printf("%s/%" PRIu64 "/_%" PRIu64 "_.bin.zst",
                                a64_cpt.output_dir, point->measure_insns,
@@ -890,11 +1040,16 @@ static bool dump_checkpoint(CPUARMState *env, uint64_t pc,
                             const A64CheckpointPoint *point)
 {
     g_autofree char *path = checkpoint_output_path(point);
-    g_autofree char *dir = g_path_get_dirname(path);
+    g_autofree char *dir = NULL;
     uint8_t *ram_ptr = memory_region_get_ram_ptr(a64_cpt.ram);
     uint64_t overshoot = actual_insns - point->checkpoint_insns;
     int fd;
     int ret;
+
+    if (!path) {
+        return false;
+    }
+    dir = g_path_get_dirname(path);
 
     if (!checkpoint_state_is_supported(env)) {
         a64_cpt.enabled = false;
