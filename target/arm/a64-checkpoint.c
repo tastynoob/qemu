@@ -75,6 +75,7 @@ typedef struct A64SnapshotLayout {
 
 typedef struct A64CheckpointState {
     bool enabled;
+    bool exact_count;
     bool window_started;
     bool exit_after_last;
     bool writing;
@@ -99,6 +100,8 @@ typedef struct A64CheckpointState {
 } A64CheckpointState;
 
 static A64CheckpointState a64_cpt;
+static bool a64_instruction_count_enabled;
+static bool a64_instruction_count_exact = true;
 
 static bool parse_u64_token(const char *token, uint64_t *value, Error **errp);
 
@@ -996,6 +999,7 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
                               uint64_t cpt_interval,
                               uint64_t warmup_interval,
                               const char *trigger,
+                              const char *instruction_count,
                               uint64_t compare_start_pc,
                               uint64_t compare_limit,
                               const char *compare_counter,
@@ -1005,6 +1009,20 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
     bool enabled;
     bool immediate_trigger;
     bool compare_exact;
+    bool exact_count;
+
+    a64_instruction_count_enabled = true;
+
+    if (!instruction_count || instruction_count[0] == '\0' ||
+        g_strcmp0(instruction_count, "exact") == 0) {
+        exact_count = true;
+    } else if (g_strcmp0(instruction_count, "tb") == 0) {
+        exact_count = false;
+    } else {
+        error_setg(errp, "instruction-count must be 'exact' or 'tb'");
+        return;
+    }
+    a64_instruction_count_exact = exact_count;
 
     enabled = mode &&
               (g_strcmp0(mode, "SimpointCheckpoint") == 0 ||
@@ -1081,6 +1099,7 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
     }
 
     a64_cpt.enabled = true;
+    a64_cpt.exact_count = exact_count;
     info_report("a64 checkpoint: enabled with %u cutpoint(s), %u PC point(s), output '%s', "
                 "warmup %" PRIu64 ", trigger %s, dropped %" PRIu64,
                 a64_cpt.points ? a64_cpt.points->len : 0,
@@ -1091,14 +1110,35 @@ void a64_checkpoint_configure(MemoryRegion *ram, uint64_t ram_base,
                 a64_cpt.dropped_points);
 }
 
+bool a64_instruction_count_is_exact(void)
+{
+    return a64_instruction_count_exact;
+}
+
+bool a64_instruction_count_is_enabled(void)
+{
+    return a64_instruction_count_enabled;
+}
+
 bool a64_checkpoint_is_timed_mode(void)
 {
     return a64_cpt.enabled && !a64_cpt.pc_mode && !a64_cpt.compare_mode;
 }
 
+bool a64_checkpoint_is_exact_timed_mode(void)
+{
+    return a64_checkpoint_is_timed_mode() && a64_cpt.exact_count;
+}
+
 bool a64_checkpoint_is_compare_mode(void)
 {
     return a64_cpt.enabled && a64_cpt.compare_mode;
+}
+
+bool a64_checkpoint_uses_exact_count(void)
+{
+    return a64_instruction_count_enabled &&
+           (a64_instruction_count_exact || a64_checkpoint_compare_uses_exact());
 }
 
 bool a64_checkpoint_compare_uses_exact(void)
@@ -1217,25 +1257,33 @@ void a64_checkpoint_notify_profiler(CPUARMState *env, bool start, uint64_t pc)
     }
 
     if (start) {
-        a64_cpt.window_base = env->profiling_insns;
+        a64_cpt.window_base = a64_cpt.exact_count ? env->exact_insns :
+                                                        env->profiling_insns;
         a64_cpt.window_started = true;
         a64_checkpoint_update_next(env);
         info_report("a64 checkpoint: profiling window started at absolute "
                     "instruction %" PRIu64, a64_cpt.window_base);
     } else {
-        if (env->profiling_insns > 0) {
-            a64_checkpoint_try_take_at(env, pc, env->profiling_insns - 1);
+        uint64_t count = a64_cpt.exact_count ? env->exact_insns :
+                                                env->profiling_insns;
+        if (count > 0) {
+            a64_checkpoint_try_take_at(env, pc, count - 1);
         }
         a64_cpt.window_started = false;
         a64_checkpoint_update_next(env);
         info_report("a64 checkpoint: profiling window stopped at absolute "
-                    "instruction %" PRIu64, env->profiling_insns);
+                    "instruction %" PRIu64, count);
     }
 }
 
 void a64_checkpoint_try_take(CPUARMState *env, uint64_t pc)
 {
     a64_checkpoint_try_take_at(env, pc, env->profiling_insns);
+}
+
+void a64_checkpoint_try_take_exact(CPUARMState *env, uint64_t pc)
+{
+    a64_checkpoint_try_take_at(env, pc, env->exact_insns);
 }
 
 void a64_checkpoint_try_take_pc(CPUARMState *env, uint64_t pc)

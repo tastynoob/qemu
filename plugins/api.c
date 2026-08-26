@@ -52,6 +52,7 @@
 #include "plugin.h"
 
 static bool a64_simtrap_profiling_mode;
+static bool a64_instruction_count_exact = true;
 
 bool qemu_plugin_a64_simtrap_in_profiling_mode(void);
 
@@ -63,6 +64,22 @@ void qemu_plugin_a64_simtrap_set_profiling_mode(bool enabled)
 bool qemu_plugin_a64_simtrap_in_profiling_mode(void)
 {
     return qatomic_read(&a64_simtrap_profiling_mode);
+}
+
+void qemu_plugin_a64_instruction_count_set_exact(bool exact)
+{
+    qatomic_set(&a64_instruction_count_exact, exact);
+}
+
+bool qemu_plugin_a64_instruction_count_is_exact(void)
+{
+    return qatomic_read(&a64_instruction_count_exact);
+}
+
+__attribute__((weak)) uint64_t
+qemu_plugin_a64_get_exact_insns(unsigned int vcpu_index)
+{
+    return 0;
 }
 
 /* Uninstall and Reset handlers */

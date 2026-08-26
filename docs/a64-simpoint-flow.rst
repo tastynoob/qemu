@@ -90,7 +90,8 @@ workload 的 ``PROFILE_START`` 和 ``PROFILE_STOP`` 定义 profiling window：
 
 * ``PROFILE_START`` 本身不计入 BBV；从其后的 guest 指令开始计数；
 * ``PROFILE_STOP`` 本身不计入 BBV；其前的 guest 指令是 profiling 的最后内容；
-* 开始窗口时清零 exact counter、interval counter 和当前 BBV 累计；
+* 开始窗口时记录 exact counter baseline，并清零 interval counter 和当前 BBV
+  累计；全局 exact counter 不需要回绕或重置；
 * stop 时只输出完整 interval，正式 SimPoint 流程使用 ``dump-final=false``。
 
 TB 元数据和精确动态贡献
@@ -103,23 +104,22 @@ TB 元数据和精确动态贡献
 * BBV 输出 ID；
 * 当前 interval 中该 TB 实际贡献的动态指令数。
 
-exact profiling 必须采用 XiangShan 的快路径组织：
+exact profiling 采用与 XiangShan 相同的性能边界，但用 QEMU 已有的精确计数器
+在 TB 边界归并实际贡献：
 
-* TB 入口用 inline scoreboard 保存 ``begin_block``、``end_block``、
-  ``current_tb_total_cnt``，并将 ``current_tb_insn_cnt`` 清零；
-* 每条指令只用 inline ``ADD`` 更新 ``current_tb_insn_cnt``，同时记录当前
-  PC 和下一条 PC；
-* TB 执行回调先按静态 TB 长度做预计数，避免在正常路径逐条处理 BBV；
-* 如果 ``middle_exit_flag`` 表明 TB 没有走到最后一条指令，执行
-  middle-exit 纠正，减去未执行尾部；
-* MMIO split TB 必须把子 TB 的实际贡献合并回原始 BB，不能重复计算或丢失
-  已执行指令。
+* TCG 每条指令只用 inline ``ADD`` 更新 exact counter；
+* TB 执行回调只在 TB 边界读取前后 exact counter，并把 delta 归并到当前 BB；
+* 正常路径不执行逐指令 C 回调、哈希查找或文件操作；
+* start/stop 位于 TB 中间时，用 window baseline 和 TB 前后 exact delta 截取
+  实际执行的 TB 前缀/后缀；
+* QEMU 恢复 TB 状态时回滚被中止指令的 exact counter，因此不依赖静态 TB 长度
+  推导中途退出贡献。
 
-``middle_exit_flag`` 不是唯一的准确性保障：XiangShan 源码明确记录了“最后一条
-指令 fault 时，单靠该 flag 可能无法检测中途退出”的边界。因此实现必须同时
-覆盖两条纠正路径：
+XiangShan 源码明确记录了“最后一条指令 fault 时，单靠 middle-exit flag 可能
+无法检测中途退出”的边界。本实现不把该 flag 当作唯一依据，而是同时覆盖两条
+纠正路径：
 
-* plugin scoreboard 纠正 TB 尾部和 MMIO split 的 BBV block contribution；
+* plugin 在 TB 边界按 exact delta 纠正 TB 尾部和 simtrap 截断的 BBV contribution；
 * QEMU ``cpu_restore_state_from_tb``/等价恢复路径回滚被中止的 exact counter。
 
 两条路径缺一不可，否则 BBV 和 checkpoint 可能分别出现不同的 off-by-one。
@@ -297,10 +297,11 @@ Exact/TB 对比
 当前实现状态
 ------------
 
-当前 ``arm-qemu-sliced`` 的正式 plugin 仍是 TB inline 计数，QEMU exact counter
-仍主要存在于 compare 诊断路径；这不满足本文档的最终目标。后续实现完成前，
-不得把现有 profiling/checkpoint 流程标记为 exact 流程，也不能用现有 TB BBV
-和目标 exact checkpoint 混合生成严格 SimPoint 结果。
+``instruction-count=exact`` 已接入正式 profiling 和 checkpoint 流程，并作为
+``mini-virt`` 默认值。profiling 插件在 TB 边界读取 QEMU exact counter 生成 BBV；
+checkpoint 在 TB 入口走 exact threshold fast path，并在命中后调用 snapshot writer。
+``instruction-count=tb`` 保留原有 TB 近似路径，必须显式指定，不能和 exact BBV 或
+exact checkpoint 混合使用。
 
 非目标
 ------

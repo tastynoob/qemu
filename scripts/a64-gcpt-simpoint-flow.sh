@@ -29,6 +29,7 @@ Environment overrides:
   SIMPOINT_PLUGIN=/path/to/libsimpoint.so
   ZSTD_BIN=/path/to/zstd
   CPU_MODEL=cortex-a57
+  INSTRUCTION_COUNT=exact|tb
   INTERVAL=10000
   WARMUP=5000
   MEMORY=1G
@@ -537,7 +538,7 @@ run_restore_qemu()
     if [[ "$restore_timeout" == 0 || "$restore_timeout" == "0s" ]]; then
         "$qemu_bin" \
             -icount shift=0,sleep=off \
-            -machine mini-virt \
+            -machine "mini-virt,instruction-count=$instruction_count" \
             -cpu "$cpu_model" \
             -smp 1 \
             -m "$memory" \
@@ -549,7 +550,7 @@ run_restore_qemu()
 
     timeout "$restore_timeout" "$qemu_bin" \
         -icount shift=0,sleep=off \
-        -machine mini-virt \
+        -machine "mini-virt,instruction-count=$instruction_count" \
         -cpu "$cpu_model" \
         -smp 1 \
         -m "$memory" \
@@ -637,6 +638,7 @@ write_summary()
         printf 'payload\t%s\n' "$payload"
         printf 'qemu\t%s\n' "$qemu_bin"
         printf 'cpu_model\t%s\n' "$cpu_model"
+        printf 'instruction_count\t%s\n' "$instruction_count"
         printf 'simpoint\t%s\n' "$simpoint_bin"
         printf 'interval\t%s\n' "$interval"
         printf 'warmup\t%s\n' "$warmup"
@@ -693,6 +695,7 @@ interval=${INTERVAL:-10000}
 warmup=${WARMUP:-5000}
 memory=${MEMORY:-1G}
 cpu_model=${CPU_MODEL:-cortex-a57}
+instruction_count=${INSTRUCTION_COUNT:-exact}
 maxk=${MAXK:-30}
 num_init_seeds=${NUM_INIT_SEEDS:-2}
 iters=${ITERS:-1000}
@@ -711,6 +714,9 @@ if [[ ! "$interval" =~ ^[0-9]+$ || "$interval" -le 0 ]]; then
 fi
 if [[ ! "$warmup" =~ ^[0-9]+$ ]]; then
     die "WARMUP must be a non-negative integer"
+fi
+if [[ "$instruction_count" != exact && "$instruction_count" != tb ]]; then
+    die "INSTRUCTION_COUNT must be exact or tb"
 fi
 if [[ ! "$maxk" =~ ^[0-9]+$ || "$maxk" -le 0 ]]; then
     die "MAXK must be a positive integer"
@@ -760,7 +766,7 @@ profile_plugin+=",target=$profile_dir,dump-final=false"
 profile_cmd=(
     "$qemu_bin"
     -icount shift=0,sleep=off
-    -machine mini-virt
+    -machine "mini-virt,instruction-count=$instruction_count"
     -cpu "$cpu_model"
     -smp 1
     -m "$memory"
@@ -805,7 +811,7 @@ if [[ "$expected_count" -le 0 ]]; then
 fi
 
 info "generating checkpoints"
-checkpoint_machine='mini-virt,checkpoint-mode=SimpointCheckpoint'
+checkpoint_machine="mini-virt,instruction-count=$instruction_count,checkpoint-mode=SimpointCheckpoint"
 checkpoint_machine+=",simpoint-path=$cluster_dir,cpt-interval=$interval"
 checkpoint_machine+=",warmup-interval=$warmup"
 checkpoint_machine+=",checkpoint-dir=$checkpoint_dir"

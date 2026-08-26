@@ -30,6 +30,10 @@ typedef struct Vcpu {
     uint64_t interval_count;
     uint64_t profile_count;
     bool started;
+    Bb *current_bb;
+    uint64_t current_tb_exact_start;
+    uint64_t profile_exact_start;
+    bool have_current_tb;
 } Vcpu;
 
 QEMU_PLUGIN_EXPORT int qemu_plugin_version = QEMU_PLUGIN_VERSION;
@@ -55,6 +59,8 @@ static uint64_t skip = 0;
 static unsigned int profile_cpu = 0;
 static bool dump_final;
 static bool profiling_mode;
+static bool exact_mode;
+static bool mode_reported;
 
 static guint bb_key_hash(gconstpointer data)
 {
@@ -242,6 +248,44 @@ static void discard_interval(unsigned int vcpu_index)
     vcpu->interval_count = 0;
 }
 
+static void add_exact_bb(unsigned int vcpu_index, Bb *bb, uint64_t insns)
+{
+    Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+
+    if (!vcpu->started || !bb || insns == 0) {
+        return;
+    }
+
+    qemu_plugin_u64_add(bb_count_u64(bb), vcpu_index, insns);
+    vcpu->interval_count += insns;
+    if (vcpu->interval_count >= interval) {
+        write_bbv_interval(vcpu_index, true);
+    }
+}
+
+static uint64_t exact_tb_delta(Vcpu *vcpu, uint64_t exact_now)
+{
+    uint64_t start = MAX(vcpu->current_tb_exact_start,
+                         vcpu->profile_exact_start);
+
+    return exact_now >= start ? exact_now - start : 0;
+}
+
+static uint64_t finalize_exact_tb(unsigned int vcpu_index,
+                                  uint64_t exact_now)
+{
+    Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+    uint64_t insns;
+
+    if (!vcpu->have_current_tb) {
+        return 0;
+    }
+
+    insns = exact_tb_delta(vcpu, exact_now);
+    add_exact_bb(vcpu_index, vcpu->current_bb, insns);
+    return insns;
+}
+
 static void vcpu_interval_exec(unsigned int vcpu_index, void *userdata)
 {
     Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
@@ -291,6 +335,12 @@ static void vcpu_stop(unsigned int vcpu_index)
         return;
     }
 
+    if (exact_mode) {
+        finalize_exact_tb(vcpu_index,
+                          qemu_plugin_a64_get_exact_insns(vcpu_index));
+        vcpu->have_current_tb = false;
+    }
+
     if (dump_final && vcpu->interval_count > 0) {
         write_bbv_interval(vcpu_index, false);
     } else {
@@ -329,9 +379,49 @@ static void vcpu_start(unsigned int vcpu_index)
 
 static void vcpu_init(unsigned int vcpu_index, void *userdata)
 {
-    if (!profiling_mode && vcpu_index == profile_cpu && skip == 0) {
-        vcpu_start(vcpu_index);
+    exact_mode = qemu_plugin_a64_instruction_count_is_exact();
+    if (!mode_reported) {
+        fprintf(stderr, "simpoint: count=%s\n",
+                exact_mode ? "exact" : "tb");
+        mode_reported = true;
     }
+    if (!profiling_mode && vcpu_index == profile_cpu && skip == 0) {
+        Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+
+        vcpu_start(vcpu_index);
+        if (exact_mode) {
+            vcpu->profile_exact_start = 0;
+        }
+    }
+}
+
+static void vcpu_tb_exec_exact(unsigned int vcpu_index, void *userdata)
+{
+    Vcpu *vcpu;
+    Bb *bb = userdata;
+    uint64_t exact_now;
+    uint64_t previous_insns = 0;
+
+    if (vcpu_index != profile_cpu) {
+        return;
+    }
+
+    vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+    exact_now = qemu_plugin_a64_get_exact_insns(vcpu_index);
+    if (vcpu->have_current_tb) {
+        previous_insns = finalize_exact_tb(vcpu_index, exact_now);
+        if (!vcpu->started && !profiling_mode && skip > 0) {
+            vcpu->skip_count += previous_insns;
+            if (vcpu->skip_count >= skip) {
+                vcpu_start(vcpu_index);
+                vcpu->profile_exact_start = exact_now;
+            }
+        }
+    }
+
+    vcpu->current_bb = bb;
+    vcpu->current_tb_exact_start = exact_now;
+    vcpu->have_current_tb = true;
 }
 
 static void vcpu_skip_exec(unsigned int vcpu_index, void *userdata)
@@ -356,14 +446,21 @@ static void vcpu_skip_exec(unsigned int vcpu_index, void *userdata)
 static void vcpu_simtrap_exec(unsigned int vcpu_index, void *userdata)
 {
     uint32_t imm = GPOINTER_TO_UINT(userdata);
+    Vcpu *vcpu;
 
     if (vcpu_index != profile_cpu) {
         return;
     }
 
+    vcpu = qemu_plugin_scoreboard_find(vcpus, vcpu_index);
+
     switch (imm) {
     case A64_SIMTRAP_PROFILE_START:
         vcpu_start(vcpu_index);
+        if (exact_mode) {
+            vcpu->profile_exact_start =
+                qemu_plugin_a64_get_exact_insns(vcpu_index) + 1;
+        }
         break;
     case A64_SIMTRAP_PROFILE_STOP:
         vcpu_stop(vcpu_index);
@@ -405,24 +502,32 @@ static void vcpu_tb_trans(struct qemu_plugin_tb *tb, void *userdata)
         }
         g_rw_lock_writer_unlock(&bbs_lock);
 
-        qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-            tb, QEMU_PLUGIN_INLINE_ADD_U64, interval_count_u64(),
-            profile_n_insns);
-        qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-            tb, QEMU_PLUGIN_INLINE_ADD_U64, bb_count_u64(bb),
-            profile_n_insns);
-        qemu_plugin_register_vcpu_tb_exec_cond_cb(
-            tb, vcpu_interval_exec, QEMU_PLUGIN_CB_NO_REGS,
-            QEMU_PLUGIN_COND_GE, interval_count_u64(), interval, NULL);
-
-        if (!profiling_mode && skip > 0) {
+        if (!exact_mode) {
             qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
-                tb, QEMU_PLUGIN_INLINE_ADD_U64, skip_count_u64(),
+                tb, QEMU_PLUGIN_INLINE_ADD_U64, interval_count_u64(),
                 profile_n_insns);
             qemu_plugin_register_vcpu_tb_exec_cond_cb(
-                tb, vcpu_skip_exec, QEMU_PLUGIN_CB_NO_REGS,
-                QEMU_PLUGIN_COND_GE, skip_count_u64(), skip, bb);
+                tb, vcpu_interval_exec, QEMU_PLUGIN_CB_NO_REGS,
+                QEMU_PLUGIN_COND_GE, interval_count_u64(), interval, NULL);
+
+            qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+                tb, QEMU_PLUGIN_INLINE_ADD_U64, bb_count_u64(bb),
+                profile_n_insns);
+
+            if (!profiling_mode && skip > 0) {
+                qemu_plugin_register_vcpu_tb_exec_inline_per_vcpu(
+                    tb, QEMU_PLUGIN_INLINE_ADD_U64, skip_count_u64(),
+                    profile_n_insns);
+                qemu_plugin_register_vcpu_tb_exec_cond_cb(
+                    tb, vcpu_skip_exec, QEMU_PLUGIN_CB_NO_REGS,
+                    QEMU_PLUGIN_COND_GE, skip_count_u64(), skip, bb);
+            }
         }
+    }
+
+    if (exact_mode) {
+        qemu_plugin_register_vcpu_tb_exec_cb(
+            tb, vcpu_tb_exec_exact, QEMU_PLUGIN_CB_NO_REGS, bb);
     }
 
     if (profiling_mode) {
@@ -449,7 +554,10 @@ static void plugin_exit(void *p)
     if (profile_cpu < qemu_plugin_num_vcpus()) {
         Vcpu *vcpu = qemu_plugin_scoreboard_find(vcpus, profile_cpu);
 
-        if (dump_final && vcpu->started && vcpu->interval_count > 0) {
+        if (exact_mode && vcpu->started) {
+            vcpu_stop(profile_cpu);
+        } else if (dump_final && vcpu->started &&
+                   vcpu->interval_count > 0) {
             write_bbv_interval(profile_cpu, false);
         }
     }
@@ -552,7 +660,6 @@ QEMU_PLUGIN_EXPORT int qemu_plugin_install(qemu_plugin_id_t id,
     bbs = g_hash_table_new_full(bb_key_hash, bb_key_equal, NULL, free_bb);
     bb_list = g_ptr_array_new();
     vcpus = qemu_plugin_scoreboard_new(sizeof(Vcpu));
-
     fprintf(stderr,
             "simpoint: output=%s interval=%" PRIu64 " skip=%" PRIu64
             " cpu=%u trigger=%s\n",

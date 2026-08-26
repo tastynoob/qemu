@@ -297,7 +297,7 @@ typedef struct CPUArchState {
     bool simtrap_daif_masked;
     /* Fuzzy TB counter: adds each translated block's static instruction count. */
     uint64_t profiling_insns;
-    /* Exact executed-instruction counter used for compare-mode diagnostics. */
+    /* Exact executed-instruction counter used by profiling/checkpoint flows. */
     uint64_t exact_insns;
     uint64_t checkpoint_next_insns;
     uint64_t svcr; /* PSTATE.{SM,ZA} in the bits they are in SVCR */

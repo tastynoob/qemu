@@ -19,6 +19,7 @@
 #include "qobject/qlist.h"
 #include "qemu/cutils.h"
 #include "qemu/error-report.h"
+#include "qemu/plugin.h"
 #include "qemu/units.h"
 #include "hw/arm/bsa.h"
 #include "hw/arm/machines-qom.h"
@@ -62,6 +63,7 @@ typedef struct MiniVirtMachineState {
     char *simpoint_file;
     uint64_t cpt_interval;
     uint64_t warmup_interval;
+    char *instruction_count;
     uint64_t compare_start_pc;
     uint64_t compare_limit;
     char *compare_counter;
@@ -277,10 +279,13 @@ static void mini_virt_init(MachineState *machine)
                              mms->simpoint_file, mms->cpt_interval,
                              mms->warmup_interval,
                              mms->checkpoint_trigger,
+                             mms->instruction_count,
                              mms->compare_start_pc,
                              mms->compare_limit,
                              mms->compare_counter,
                              mms->checkpoint_exit_after_last, &local_err);
+    qemu_plugin_a64_instruction_count_set_exact(
+        g_strcmp0(mms->instruction_count, "tb") != 0);
     if (local_err) {
         error_reportf_err(local_err, "mini-virt checkpoint setup failed: ");
         exit(1);
@@ -446,6 +451,19 @@ static void mini_virt_set_warmup_interval(Object *obj, const char *value,
     mms->warmup_interval = interval;
 }
 
+static void mini_virt_set_instruction_count(Object *obj, const char *value,
+                                             Error **errp)
+{
+    MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
+
+    if (g_strcmp0(value, "exact") != 0 && g_strcmp0(value, "tb") != 0) {
+        error_setg(errp, "instruction-count must be 'exact' or 'tb'");
+        return;
+    }
+    g_free(mms->instruction_count);
+    mms->instruction_count = g_strdup(value);
+}
+
 static void mini_virt_set_compare_start_pc(Object *obj, const char *value,
                                             Error **errp)
 {
@@ -515,6 +533,7 @@ static void mini_virt_instance_init(Object *obj)
     MiniVirtMachineState *mms = MINI_VIRT_MACHINE(obj);
 
     mms->platform = g_strdup("fs");
+    mms->instruction_count = g_strdup("exact");
     mms->checkpoint_exit_after_last = true;
 }
 
@@ -531,6 +550,7 @@ static void mini_virt_instance_finalize(Object *obj)
     g_free(mms->cutpoints_file);
     g_free(mms->simpoint_path);
     g_free(mms->simpoint_file);
+    g_free(mms->instruction_count);
     g_free(mms->compare_counter);
 }
 
@@ -570,6 +590,8 @@ static void mini_virt_machine_init(MachineClass *mc)
                                   mini_virt_set_cpt_interval);
     object_class_property_add_str(oc, "warmup-interval", NULL,
                                   mini_virt_set_warmup_interval);
+    object_class_property_add_str(oc, "instruction-count", NULL,
+                                  mini_virt_set_instruction_count);
     object_class_property_add_str(oc, "instruction-count-compare-pc", NULL,
                                   mini_virt_set_compare_start_pc);
     object_class_property_add_str(oc, "instruction-count-compare-limit", NULL,

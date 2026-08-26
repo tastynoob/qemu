@@ -98,7 +98,7 @@ profiling 通过 ``libsimpoint.so`` 插件生成 gzip 压缩的 SimPoint 3.2 BBV
 
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
-    -machine mini-virt \
+    -machine mini-virt,platform=bm,instruction-count=exact \
     -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
@@ -112,7 +112,17 @@ profiling 通过 ``libsimpoint.so`` 插件生成 gzip 压缩的 SimPoint 3.2 BBV
   由 workload 中的 ``PROFILE_START`` 和 ``PROFILE_STOP`` 控制 profiling window。
 
 ``interval=<interval>``
-  BBV interval 的目标长度，以 guest 指令数计。插件把一个 QEMU TB 作为一个 basic block；累计指令数达到 interval 后，在该 TB 结束边界输出 vector，不会把同一个 TB 拆到相邻 vector。跨界 TB 产生的 drift 会带入下一段的阈值计算，所以单个 vector 可能略长或略短，但第 ``k`` 个累计边界始终位于 ``k * interval`` 之后的首个 TB 边界附近，不会累计偏移。后续 checkpoint 使用 SimPoint location 时，需要用同一个 interval 按 ``location * interval`` 计算请求切点。
+  BBV interval 的目标长度，以 exact dynamic guest instruction 数计。BBV 只在 TB
+  边界输出，不在 TB 内拆分；跨界 TB 产生的 overshoot 会记录在实际 vector 中，
+  不会按 TB 静态长度累计成长期漂移。后续 checkpoint 使用 SimPoint location 时，
+  必须使用同一个 interval 和 ``instruction-count`` 模式。
+
+``instruction-count=exact|tb``
+  统一控制 QEMU 内部计数、profiling BBV 和 checkpoint 调度，默认是 ``exact``。
+  exact 模式在翻译后的每条指令执行路径更新一个轻量计数器，但插件只在 TB 边界
+  读取并归并 BBV，checkpoint 也只在 TB 边界检查和生成 snapshot。``tb`` 必须
+  显式指定，使用 TB 快速近似计数，仅适合速度对照或兼容旧流程；profiling 和
+  checkpoint 两次运行必须保持同一个模式。
 
 ``target=<profile-dir>``
   profiling 输出目录。插件会写入 ``<profile-dir>/simpoint_bbv.gz``。
@@ -140,61 +150,61 @@ BBV 内容是 SimPoint 3.2 文本格式，gzip 压缩。每行表示一个 inter
 
   T:<bb-id>:<instruction-count> :<bb-id>:<instruction-count> ...
 
-其中 ``bb-id`` 由插件按翻译到的 QEMU TB 分配，``instruction-count`` 是该 basic block 在当前 interval 内贡献的指令数。当前插件使用 TB 粒度的快路径计数：每次进入 TB 时，把该 TB 的静态指令数一次性累加到 interval 和 BBV。同步异常或访存 fault 导致 TB 提前退出时，尚未执行的 TB 尾部也可能被预记，因此这是近似计数。simtrap 仍在伪指令执行处单独处理，以定义 profiling window 的开始和结束。
+其中 ``bb-id`` 由插件按翻译到的 QEMU TB 分配，``instruction-count`` 是该 TB
+在当前 interval 内实际贡献的动态指令数。exact 模式的计数来自 QEMU AArch64
+逐指令计数器，插件在 TB 边界归并当前 TB 的 exact delta；TB 中途异常时，QEMU
+恢复 TB 状态会回滚尚未完成的指令计数。simtrap 仍在伪指令执行处单独处理，以定义
+profiling window 的开始和结束。
 
 
 QEMU 精确计数与插件 TB 计数
 ----------------------------
 
-当前代码中的两种计数分别属于不同层次，不能通过插件参数互相切换：
+当前代码中的两种计数由 ``mini-virt`` 的统一 machine 参数切换：
 
 ``exact``
   QEMU AArch64 TCG 内部的逐指令计数器，每条实际进入执行的 guest 指令累加一次。
-  该方式开销较大，但不会把因异常或 fault 而未执行的 TB 尾部计入。它目前只用于
-  QEMU 的 instruction-count compare 诊断，不会被 ``libsimpoint.so`` 读取，也不
-  会生成 BBV。
+  该方式开销较大，但不会把因异常或 fault 而未执行的 TB 尾部计入。它是正式
+  SimPoint profiling/checkpoint 流程的默认计数口径。
 
 ``tb``
-  插件和 checkpoint 快路径在 TB 入口一次性累加该 TB 的静态指令数。该方式运行
-  速度更快，但属于近似计数；正常完整执行 TB 时误差通常较小，TB 中途退出时可能
-  产生较大偏差。
+  插件和 checkpoint 快路径按 TB 静态指令数累计。该方式运行速度更快，但属于
+  近似计数；TB 中途退出时可能把未执行的尾部计入。
 
-``libsimpoint.so`` 只能使用 ``tb`` 计数；它没有 exact 计数插件选项。上面的
-profiling 命令即为插件 TB 计数用法。现有 ``scripts/a64-gcpt-simpoint-flow.sh``
-也属于 TB 近似流程，不能标记为严格的 exact SimPoint 流程。
+``libsimpoint.so`` 通过同一个 machine 参数读取 exact/TB 模式，不再单独增加
+插件计数开关。上面的 profiling 命令使用默认 exact 计数；若要做速度对照，只需
+把 machine 参数改成 ``instruction-count=tb``。
 
-QEMU 目前提供 exact/TB 对比模式，用于从同一 PC 开始测量 QEMU 内部精确计数与
-TB 计数的差异和速度。它不生成 BBV 或 checkpoint，也不会改变 ``libsimpoint.so``
-和常规 checkpoint 调度所使用的 TB 计数。精确计数的用法如下：
+QEMU 仍提供 compare 参数，用于从同一 PC 开始测量 exact/TB 的差异和速度；它
+不替代正式 profiling/checkpoint 流程。精确 compare 的用法如下：
 
 .. code-block:: shell
 
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
-    -machine mini-virt,platform=bm,checkpoint-mode=SimpointCheckpoint,instruction-count-compare-pc=<start-pc>,instruction-count-compare-limit=<count>,instruction-count-compare-counter=exact \
+    -machine mini-virt,platform=bm,instruction-count=exact,checkpoint-mode=SimpointCheckpoint,instruction-count-compare-pc=<start-pc>,instruction-count-compare-limit=<count>,instruction-count-compare-counter=exact \
     -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
     -nographic \
     -kernel <payload.bin-or-checkpoint.bin.zst>
 
-TB 计数的用法只需把最后一个 machine 参数改为：
+TB 计数对照需要同时把 machine 模式和 compare counter 改为：
 
 .. code-block:: text
 
-  instruction-count-compare-counter=tb
+  instruction-count=tb,instruction-count-compare-counter=tb
 
 ``instruction-count-compare-pc`` 必须是实际执行路径上的 TB 入口 PC。QEMU 第一次
 到达该 PC 时清零计数器；所选计数器达到 ``instruction-count-compare-limit`` 后
 QEMU 自动退出。``exact`` 模式的日志同时打印 ``exact``、``tb`` 和
-``delta=tb-exact``，可直接比较误差；``tb`` 模式不会生成逐指令更新，适合单独
-测量 TB 快路径速度。省略 ``instruction-count-compare-counter`` 时默认使用
+``delta=tb-exact``，可直接比较误差；同时使用 ``instruction-count=tb`` 时不会
+生成逐指令更新，适合单独测量 TB 快路径速度。省略 ``instruction-count-compare-counter`` 时默认使用
 ``exact``。全系统 payload 应把 ``platform=bm`` 改为 ``platform=fs``。
 
-注意，``instruction-count-compare-counter=exact`` 目前只是 QEMU 内部诊断选项，
-不能把 ``libsimpoint.so`` 的 BBV 切换为精确计数。若要实现严格 exact SimPoint，
-需要另行修改 BBV 生成和 checkpoint 切点调度，让它们共享精确计数；当前插件和
-脚本仍然是 TB 近似流程。
+正式流程不要把 compare 参数和 ``instruction-count`` 混用成两套口径；profiling
+和 checkpoint 只需统一设置 ``instruction-count=exact``（默认值），并使用相同
+的 interval。
 
 后续使用 SimPoint 3.2 对 ``simpoint_bbv.gz`` 做 cluster，通常会得到：
 
@@ -217,7 +227,7 @@ checkpoint 模式根据切点在 profiling window 内生成 snapshot。切点可
 
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
-    -machine mini-virt,checkpoint-mode=SimpointCheckpoint,cutpoints=<cutpoint-list>,checkpoint-dir=<checkpoint-dir> \
+    -machine mini-virt,platform=bm,instruction-count=exact,checkpoint-mode=SimpointCheckpoint,cutpoints=<cutpoint-list>,checkpoint-dir=<checkpoint-dir> \
     -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
@@ -230,7 +240,7 @@ SimPoint cluster 切点命令模板：
 
   build/qemu-system-aarch64 \
     -icount shift=0,sleep=off \
-    -machine mini-virt,checkpoint-mode=SimpointCheckpoint,simpoint-path=<simpoint-dir>,cpt-interval=<interval>,warmup-interval=<warmup>,checkpoint-dir=<checkpoint-dir> \
+    -machine mini-virt,platform=bm,instruction-count=exact,checkpoint-mode=SimpointCheckpoint,simpoint-path=<simpoint-dir>,cpt-interval=<interval>,warmup-interval=<warmup>,checkpoint-dir=<checkpoint-dir> \
     -cpu <cpu-model> \
     -smp 1 \
     -m <memory-size> \
@@ -367,9 +377,7 @@ PROFILE_START，并要求恢复后的workload正常运行到PROFILE_STOP。
 推荐流程
 ========
 
-下面是当前可直接运行的 TB 近似流程；它适合验证 QEMU、生成 checkpoint 和测量
-运行速度，但不能作为严格 exact SimPoint 结果。严格流程需要先将逐指令计数接入
-BBV 生成和 checkpoint 调度，详见上面的“精确指令计数与 TB 指令计数”。
+下面是当前可直接运行的 exact SimPoint 流程；TB 近似模式仅用于显式的速度对照。
 
 1. 构建 QEMU 和插件。
 2. 使用 ``libsimpoint.so,trigger=simtrap`` 运行 workload，得到 ``simpoint_bbv.gz``。
@@ -385,4 +393,4 @@ gcpt gemm 的 profiling、SimPoint cluster 和 checkpoint 生成可以直接用�
 
 脚本默认从当前 checkout 所在 workspace 的同级 ``unified-workload`` 中查找 ``qemu-minivirt-aarch64-gcpt/gemm/gcpt/gcpt.bin``，也可以用 ``PAYLOAD=...`` 显式指定；``CPU_MODEL`` 默认为 ``cortex-a57``，profiling、checkpoint 和 restore validation 始终使用同一个值；``INTERVAL`` 默认为 ``10000``，``WARMUP`` 默认为 ``5000``。流程由 workload 内的 simtrap 控制开始和结束，不使用额外的 max-insn 截断；输出目录默认在 ``/tmp``，可用 ``OUT_DIR=...`` 覆盖。脚本不接受包含空白字符的路径。恢复校验直接读取流式header中的PC并与生成日志比对，同时要求恢复后的workload正常执行到PROFILE_STOP，不再依赖旧restorer的成功日志。
 
-主流程使用 ``dump-final=false``，只把完整 interval 交给 SimPoint。原始聚类结果保存在 ``simpoints0.raw`` 和 ``weights0.raw``；measurement point 小于 ``WARMUP`` 的代表点记录到 ``dropped-warmup.tsv`` 并从 checkpoint 输入中移除，剩余 ``weights0`` 重新归一化到 100%。这是有意保留的启动阶段丢弃策略。脚本要求每个保留代表点都成功生成 checkpoint，运行时越过 measurement point 或缺少文件都会使流程失败。``summary.txt`` 会记录 profile 尾段、丢弃点原始权重和保留点原始权重；``slices.tsv`` 和 ``restore-validation.tsv`` 分别校验每个保留 slice 的请求/实际切点，以及snapshot header PC和恢复执行结果。
+主流程使用 ``dump-final=false``，只把完整 exact interval 交给 SimPoint。原始聚类结果保存在 ``simpoints0.raw`` 和 ``weights0.raw``；measurement point 小于 ``WARMUP`` 的代表点记录到 ``dropped-warmup.tsv`` 并从 checkpoint 输入中移除，剩余 ``weights0`` 重新归一化到 100%。这是有意保留的启动阶段丢弃策略。脚本要求每个保留代表点都成功生成 checkpoint，运行时越过 measurement point 或缺少文件都会使流程失败。``summary.txt`` 会记录 profile 尾段、丢弃点原始权重和保留点原始权重；``slices.tsv`` 和 ``restore-validation.tsv`` 分别校验每个保留 slice 的请求/实际切点，以及snapshot header PC和恢复执行结果。

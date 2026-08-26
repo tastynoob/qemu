@@ -384,6 +384,14 @@ updates the counter and compares the next threshold; it calls the checkpoint
 helper only after the threshold is reached. Normal execution and PC-triggered
 checkpointing do not contain this counter update.
 
+The formal mini-virt profiling/checkpoint flow uses the machine option
+``instruction-count=exact|tb``. It defaults to ``exact``: TCG updates an
+executed-instruction counter once per translated guest instruction, while the
+SimPoint plugin and checkpoint writer consume it only at translated-block
+boundaries. ``instruction-count=tb`` explicitly selects the older TB-level
+approximation and must be used consistently for both profiling and checkpoint
+generation.
+
 For comparing the two counting methods, set both mini-virt properties
 ``instruction-count-compare-pc=PC`` and
 ``instruction-count-compare-limit=N``. The counters are reset when execution
@@ -392,8 +400,10 @@ reaches ``N``. The log fields are ``exact`` (one increment per entered guest
 instruction), ``tb`` (the TB-level ``profiling_insns`` estimate), and
 ``delta=tb-exact``. The compare properties are diagnostic only; they do not
 change the checkpoint format or the normal checkpoint scheduling path.
-Set ``instruction-count-compare-counter=tb`` to stop on the TB counter without
-emitting the exact per-instruction update; the default is ``exact``.
+Set both ``instruction-count=tb`` and
+``instruction-count-compare-counter=tb`` to stop on the TB counter without
+emitting the exact per-instruction update; the default machine mode and compare
+counter are both ``exact``.
 
 Example::
 

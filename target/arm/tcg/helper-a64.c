@@ -176,6 +176,11 @@ void HELPER(a64_checkpoint)(CPUARMState *env, uint64_t pc)
     a64_checkpoint_try_take(env, pc);
 }
 
+void HELPER(a64_checkpoint_exact)(CPUARMState *env, uint64_t pc)
+{
+    a64_checkpoint_try_take_exact(env, pc);
+}
+
 void HELPER(a64_checkpoint_pc)(CPUARMState *env, uint64_t pc)
 {
     a64_checkpoint_try_take_pc(env, pc);

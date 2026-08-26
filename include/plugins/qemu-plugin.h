@@ -1305,6 +1305,25 @@ QEMU_PLUGIN_API
 void qemu_plugin_a64_simtrap_set_profiling_mode(bool enabled);
 
 /**
+ * qemu_plugin_a64_instruction_count_is_exact() - query the AArch64 count mode
+ *
+ * Returns true when the mini-virt instruction-count mode uses the exact
+ * translated-instruction counter. The mode is selected by the machine, not
+ * by an individual plugin.
+ */
+QEMU_PLUGIN_API
+bool qemu_plugin_a64_instruction_count_is_exact(void);
+
+/**
+ * qemu_plugin_a64_get_exact_insns() - read the AArch64 exact counter
+ *
+ * This is valid from a vCPU callback and returns the counter value for the
+ * selected vCPU. The counter is intended for TB-boundary accounting.
+ */
+QEMU_PLUGIN_API
+uint64_t qemu_plugin_a64_get_exact_insns(unsigned int vcpu_index);
+
+/**
  * qemu_plugin_scoreboard_new() - alloc a new scoreboard
  *
  * @element_size: size (in bytes) for one entry

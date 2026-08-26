@@ -22,9 +22,11 @@
 #include "qemu/qemu-print.h"
 #include "qemu/timer.h"
 #include "qemu/log.h"
+#include "plugins/qemu-plugin.h"
 #include "exec/page-vary.h"
 #include "system/whpx.h"
 #include "target/arm/tcg/idau.h"
+#include "target/arm/a64-checkpoint.h"
 #include "qemu/module.h"
 #include "qapi/error.h"
 #include "cpu.h"
@@ -115,6 +117,9 @@ void arm_restore_state_to_opc(CPUState *cs,
         }
         env->condexec_bits = 0;
         env->exception.syndrome = data[2] << ARM_INSN_START_WORD2_SHIFT;
+        if (env->exact_insns > 0 && a64_checkpoint_uses_exact_count()) {
+            env->exact_insns--;
+        }
     } else {
         if (tb_cflags(tb) & CF_PCREL) {
             env->regs[15] = (env->regs[15] & TARGET_PAGE_MASK) | data[0];
@@ -124,6 +129,16 @@ void arm_restore_state_to_opc(CPUState *cs,
         env->condexec_bits = data[1];
         env->exception.syndrome = data[2] << ARM_INSN_START_WORD2_SHIFT;
     }
+}
+
+uint64_t qemu_plugin_a64_get_exact_insns(unsigned int vcpu_index)
+{
+    CPUState *cs = qemu_get_cpu(vcpu_index);
+
+    if (!cs || !is_a64(cpu_env(cs))) {
+        return 0;
+    }
+    return cpu_env(cs)->exact_insns;
 }
 
 int arm_cpu_mmu_index(CPUState *cs, bool ifetch)

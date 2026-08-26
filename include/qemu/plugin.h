@@ -53,6 +53,7 @@ static inline void qemu_plugin_add_opts(void)
 
 void qemu_plugin_opt_parse(const char *optstr, QemuPluginList *head);
 int qemu_plugin_load_list(QemuPluginList *head, Error **errp);
+void qemu_plugin_a64_instruction_count_set_exact(bool exact);
 
 union qemu_plugin_cb_sig {
     qemu_plugin_udata_cb_t               udata;
@@ -233,6 +234,9 @@ static inline enum qemu_plugin_cb_flags qemu_plugin_get_cb_flags(void)
 }
 
 #else /* !CONFIG_PLUGIN */
+
+static inline void qemu_plugin_a64_instruction_count_set_exact(bool exact)
+{ }
 
 static inline void qemu_plugin_add_opts(void)
 { }

@@ -11074,7 +11074,23 @@ static void aarch64_tr_tb_start(DisasContextBase *db, CPUState *cpu)
             tcg_env, tcg_constant_i64(db->pc_first));
     }
 
-    if (a64_checkpoint_is_timed_mode() ||
+    if (a64_checkpoint_is_exact_timed_mode()) {
+        TCGv_i64 count = tcg_temp_new_i64();
+        TCGv_i64 next = tcg_temp_new_i64();
+        TCGLabel *fast_path = gen_new_label();
+
+        tcg_gen_ld_i64(count, tcg_env,
+                       offsetof(CPUARMState, exact_insns));
+        tcg_gen_ld_i64(next, tcg_env,
+                       offsetof(CPUARMState, checkpoint_next_insns));
+        tcg_gen_brcond_i64(TCG_COND_LTU, count, next, fast_path);
+        gen_helper_a64_checkpoint_exact(tcg_env,
+                                        tcg_constant_i64(db->pc_first));
+        gen_set_label(fast_path);
+    }
+
+    if ((a64_checkpoint_is_timed_mode() &&
+         !a64_checkpoint_is_exact_timed_mode()) ||
         a64_checkpoint_is_compare_mode()) {
         TCGv_i64 count = tcg_temp_new_i64();
 
@@ -11304,9 +11320,9 @@ void aarch64_translate_code(CPUState *cpu, TranslationBlock *tb,
     TranslatorOps ops = aarch64_translator_ops;
     DisasContext dc = {};
 
-    /* Exact counting is a diagnostic-only path and must stay off the
-     * normal profiling/checkpoint fast path. */
-    if (a64_checkpoint_compare_uses_exact()) {
+    if ((a64_instruction_count_is_enabled() &&
+         a64_instruction_count_is_exact()) ||
+        a64_checkpoint_compare_uses_exact()) {
         ops.exact_insn_count = &cpu_exact_insns;
     }
     translator_loop(cpu, tb, max_insns, pc, host_pc,
