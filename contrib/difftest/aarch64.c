@@ -9,7 +9,10 @@
 #include "qemu/timer.h"
 #include "accel/tcg/cpu-loop.h"
 #include "exec/cpu-common.h"
+#include "hw/core/boards.h"
 #include "hw/core/cpu.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "system/cpus.h"
 #include "system/replay.h"
 #include "system/system.h"
@@ -18,8 +21,13 @@
 
 static CPUState *difftest_cpu;
 static bool difftest_initialized;
+static bool difftest_has_stepped;
 static char *difftest_machine_arg;
 static DifftestRegPtrs difftest_reg_ptrs;
+static MemoryRegion difftest_backed_ram;
+static bool difftest_backed_ram_mapped;
+
+#define DIFFTEST_MINI_VIRT_RAM_BASE 0x40000000ULL
 
 /* system/main.c is intentionally not part of the shared library. */
 int (*qemu_main)(void);
@@ -140,6 +148,10 @@ int difftest_step(uint64_t n)
         return -EINVAL;
     }
 
+    if (n) {
+        difftest_has_stepped = true;
+    }
+
     for (uint64_t i = 0; i < n; i++) {
         int ret;
 
@@ -158,6 +170,49 @@ int difftest_step(uint64_t n)
         return ret;
     }
 
+    return 0;
+}
+
+int difftest_memcpy(uint64_t addr, void *buf, size_t n, bool direction)
+{
+    MemTxResult result;
+
+    if (!difftest_initialized || !buf) {
+        return -EINVAL;
+    }
+    if (direction != DIFFTEST_TO_DUT && direction != DIFFTEST_TO_REF) {
+        return -EINVAL;
+    }
+
+    result = address_space_rw(&address_space_memory, addr,
+                              MEMTXATTRS_UNSPECIFIED, buf, n,
+                              direction == DIFFTEST_TO_REF);
+    return result == MEMTX_OK ? 0 : -EIO;
+}
+
+int difftest_get_backed_memory(void *backed_mem, size_t n)
+{
+    if (!difftest_initialized || !current_machine || !backed_mem) {
+        return -EINVAL;
+    }
+    if (difftest_has_stepped || difftest_backed_ram_mapped) {
+        return -EBUSY;
+    }
+    if (n != current_machine->ram_size ||
+        n != memory_region_size(current_machine->ram)) {
+        return -EINVAL;
+    }
+
+    bql_lock();
+    memory_region_init_ram_ptr(&difftest_backed_ram, NULL,
+                               "mini-virt.difftest-backed-ram", n,
+                               backed_mem);
+    memory_region_add_subregion_overlap(get_system_memory(),
+                                        DIFFTEST_MINI_VIRT_RAM_BASE,
+                                        &difftest_backed_ram, 1);
+    bql_unlock();
+
+    difftest_backed_ram_mapped = true;
     return 0;
 }
 

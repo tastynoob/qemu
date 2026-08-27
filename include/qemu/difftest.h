@@ -6,6 +6,8 @@
 #ifndef QEMU_DIFFTEST_H
 #define QEMU_DIFFTEST_H
 
+#include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 #if defined(_WIN32)
@@ -52,11 +54,30 @@ typedef enum DifftestMiscRegId {
     DIFFTEST_MISC_SP_EL3,
 } DifftestMiscRegId;
 
+typedef enum DifftestDirection {
+    DIFFTEST_TO_DUT,
+    DIFFTEST_TO_REF,
+} DifftestDirection;
+
 /* Initialize one paused mini-virt AArch64 reference CPU. */
 QEMU_DIFFTEST_EXPORT int difftest_init(const char *platform);
 
 /* Execute n guest instructions on the initialized reference CPU. */
 QEMU_DIFFTEST_EXPORT int difftest_step(uint64_t n);
+
+/*
+ * Copy guest physical memory between the DUT buffer and the reference.
+ * DIFFTEST_TO_REF writes the DUT buffer into QEMU; DIFFTEST_TO_DUT reads it.
+ */
+QEMU_DIFFTEST_EXPORT int difftest_memcpy(uint64_t addr, void *buf, size_t n,
+                                        bool direction);
+
+/*
+ * Replace mini-virt RAM with a caller-owned COW mapping.  This must be called
+ * before the first difftest_step(); QEMU never frees the supplied mapping.
+ */
+QEMU_DIFFTEST_EXPORT int difftest_get_backed_memory(void *backed_mem,
+                                                    size_t n);
 
 /* Return the stable, directly readable and writable register pointer table. */
 QEMU_DIFFTEST_EXPORT DifftestRegPtrs *difftest_getregptr(void);
