@@ -74,6 +74,17 @@ static QemuMutex bql;
  * The chosen accelerator is supposed to register this.
  */
 static const AccelOpsClass *cpus_accel;
+static bool difftest_direct_cpu;
+
+void qemu_cpu_difftest_set_direct(bool enabled)
+{
+    difftest_direct_cpu = enabled;
+}
+
+bool qemu_cpu_difftest_direct(void)
+{
+    return difftest_direct_cpu;
+}
 
 bool cpu_is_stopped(CPUState *cpu)
 {
@@ -917,4 +928,3 @@ void qmp_inject_nmi(Error **errp)
 {
     nmi_monitor_handle(monitor_get_cpu_index(monitor_cur()), errp);
 }
-

@@ -4393,6 +4393,18 @@ foreach target : target_dirs
                  c_args: c_args,
                  build_by_default: false)
 
+  if target == 'aarch64-softmmu'
+    shared_library('qemu-aarch64-difftest',
+                   files('contrib/difftest/aarch64.c'),
+                   install: false,
+                   build_by_default: get_option('b_staticpic'),
+                   dependencies: arch_deps + [sdl, target_stubs],
+                   objects: lib.extract_all_objects(recursive: true),
+                   include_directories: target_inc,
+                   c_args: c_args,
+                   link_args: link_args)
+  endif
+
   if target.endswith('-softmmu')
     execs = [{
       'name': 'qemu-system-' + target_name,

@@ -22,6 +22,10 @@ void cpu_thread_signal_created(CPUState *cpu);
 void cpu_thread_signal_destroyed(CPUState *cpu);
 void cpu_handle_guest_debug(CPUState *cpu);
 
+/* Use the caller's thread as the TCG vCPU for library-style difftest. */
+void qemu_cpu_difftest_set_direct(bool enabled);
+bool qemu_cpu_difftest_direct(void);
+
 /* end interface for cpus accelerator threads */
 
 bool qemu_in_vcpu_thread(void);
