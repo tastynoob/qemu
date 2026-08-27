@@ -18,11 +18,52 @@
 extern "C" {
 #endif
 
+enum {
+    DIFFTEST_GPR_COUNT = 32,
+    DIFFTEST_VREG_COUNT = 32,
+    DIFFTEST_VREG_U64_COUNT = 2,
+};
+
+/*
+ * Stable pointers into the reference CPU state.  xregs[31] is SP and each
+ * vregs entry points to a 128-bit register stored as two uint64_t lanes.
+ * The pointers remain valid for the lifetime of the initialized CPU and may
+ * only be accessed while difftest_step() is not executing.
+ */
+typedef struct DifftestRegPtrs {
+    uint64_t *xregs[DIFFTEST_GPR_COUNT];
+    uint64_t *pc;
+    uint64_t *vregs[DIFFTEST_VREG_COUNT];
+} DifftestRegPtrs;
+
+typedef enum DifftestMiscRegId {
+    DIFFTEST_MISC_PSTATE,
+    DIFFTEST_MISC_FPSR,
+    DIFFTEST_MISC_FPCR,
+    DIFFTEST_MISC_SPSR_EL1,
+    DIFFTEST_MISC_SPSR_EL2,
+    DIFFTEST_MISC_SPSR_EL3,
+    DIFFTEST_MISC_ELR_EL1,
+    DIFFTEST_MISC_ELR_EL2,
+    DIFFTEST_MISC_ELR_EL3,
+    DIFFTEST_MISC_SP_EL0,
+    DIFFTEST_MISC_SP_EL1,
+    DIFFTEST_MISC_SP_EL2,
+    DIFFTEST_MISC_SP_EL3,
+} DifftestMiscRegId;
+
 /* Initialize one paused mini-virt AArch64 reference CPU. */
 QEMU_DIFFTEST_EXPORT int difftest_init(const char *platform);
 
 /* Execute n guest instructions on the initialized reference CPU. */
 QEMU_DIFFTEST_EXPORT int difftest_step(uint64_t n);
+
+/* Return the stable, directly readable and writable register pointer table. */
+QEMU_DIFFTEST_EXPORT DifftestRegPtrs *difftest_getregptr(void);
+
+/* Read or write architectural state that cannot expose a stable pointer. */
+QEMU_DIFFTEST_EXPORT int difftest_getmisc(uint32_t regid, uint64_t *value);
+QEMU_DIFFTEST_EXPORT int difftest_setmisc(uint32_t regid, uint64_t value);
 
 #ifdef __cplusplus
 }
