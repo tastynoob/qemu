@@ -52,6 +52,54 @@ typedef enum DifftestMiscRegId {
     DIFFTEST_MISC_SP_EL1,
     DIFFTEST_MISC_SP_EL2,
     DIFFTEST_MISC_SP_EL3,
+
+    /*
+     * This enum is a shared-library ABI, not an internal QEMU-only enum.
+     * Append new IDs so every previously published numeric value remains
+     * unchanged, and keep this order identical to gem5's DifftestMiscReg.
+     *
+     * Synchronize the complete AArch64 thread-ID register family.  These
+     * registers remain architecturally live across ordinary instructions and
+     * are also used by exception-vector code.  A DUT that restores or changes
+     * one of them must be able to transfer the value to the reference before
+     * instruction-by-instruction comparison resumes.
+     */
+    DIFFTEST_MISC_TPIDR_EL0,
+    DIFFTEST_MISC_TPIDRRO_EL0,
+    DIFFTEST_MISC_TPIDR_EL1,
+    DIFFTEST_MISC_TPIDR_EL2,
+    DIFFTEST_MISC_TPIDR_EL3,
+
+    /*
+     * gem5 handles ARM exception entry locally and then resynchronizes this
+     * reference instead of executing QEMU's own exception entry.  FAR and ESR
+     * banks for EL1 through EL3 are therefore live architectural state for the
+     * next instruction
+     * in an exception handler: without these slots, a following MRS reads the
+     * fault data of an earlier QEMU exception rather than gem5's current one.
+     * All target ELs are transferred because exception routing and later ERET
+     * can expose a bank that was inactive when synchronization occurred.
+     *
+     * Append, rather than insert, these IDs.  This enum is a shared-library
+     * ABI and its numeric ordering must remain identical to gem5's
+     * DifftestMiscReg.
+     */
+    DIFFTEST_MISC_FAR_EL1,
+    DIFFTEST_MISC_ESR_EL1,
+    DIFFTEST_MISC_FAR_EL2,
+    DIFFTEST_MISC_ESR_EL2,
+    DIFFTEST_MISC_FAR_EL3,
+    DIFFTEST_MISC_ESR_EL3,
+
+    /*
+     * CTR_EL0 is an implementation-defined, read-only description of cache
+     * behavior.  gem5 and QEMU may legitimately choose different reset
+     * values, so difftest synchronizes the DUT value into the reference CPU
+     * model before executing guest code.  Append this ID to preserve every
+     * existing shared-library ABI value, and keep its position identical to
+     * gem5's DifftestMiscReg enum.
+     */
+    DIFFTEST_MISC_CTR_EL0,
 } DifftestMiscRegId;
 
 typedef enum DifftestDirection {
