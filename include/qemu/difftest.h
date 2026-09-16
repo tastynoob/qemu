@@ -52,7 +52,24 @@ typedef enum DifftestMiscRegId {
     DIFFTEST_MISC_SP_EL1,
     DIFFTEST_MISC_SP_EL2,
     DIFFTEST_MISC_SP_EL3,
+    /* Read-only extensions: guest MSR instructions maintain these fields. */
+    DIFFTEST_MISC_TPIDR_EL0,
+    DIFFTEST_MISC_TPIDRRO_EL0,
+    DIFFTEST_MISC_TPIDR_EL1,
+    DIFFTEST_MISC_TPIDR_EL2,
+    DIFFTEST_MISC_TPIDR_EL3,
 } DifftestMiscRegId;
+
+/* Literal EL1..EL3 banks, without architectural VHE alias redirection. */
+typedef struct DifftestExceptionState {
+    uint64_t entered;
+    uint64_t pc;
+    uint64_t pstate;
+    uint64_t spsr[3];
+    uint64_t elr[3];
+    uint64_t esr[3];
+    uint64_t far[3];
+} DifftestExceptionState;
 
 typedef enum DifftestDirection {
     DIFFTEST_TO_DUT,
@@ -64,6 +81,10 @@ QEMU_DIFFTEST_EXPORT int difftest_init(const char *platform);
 
 /* Execute n guest instructions on the initialized reference CPU. */
 QEMU_DIFFTEST_EXPORT int difftest_step(uint64_t n);
+
+/* Observe exception entry during the last step; never writes CPU state. */
+QEMU_DIFFTEST_EXPORT int difftest_get_exception_state(
+    DifftestExceptionState *state, size_t size);
 
 /*
  * Copy guest physical memory between the DUT buffer and the reference.

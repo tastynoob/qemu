@@ -26,6 +26,7 @@ static char *difftest_machine_arg;
 static DifftestRegPtrs difftest_reg_ptrs;
 static MemoryRegion difftest_backed_ram;
 static bool difftest_backed_ram_mapped;
+static bool difftest_exception_entered;
 
 #define DIFFTEST_MINI_VIRT_RAM_BASE 0x40000000ULL
 
@@ -82,6 +83,36 @@ static uint64_t *difftest_spsr_ptr(CPUARMState *env, unsigned int el)
     return &env->banked_spsr[aarch64_banked_spsr_index(el)];
 }
 
+static void difftest_exception_entry_hook(ARMCPU *cpu, void *opaque)
+{
+    int exception = CPU(cpu)->exception_index;
+
+    /* ERET also invokes the EL-change hook, but has no pending exception. */
+    if (exception >= 0 && exception < EXCP_INTERRUPT) {
+        difftest_exception_entered = true;
+    }
+}
+
+int difftest_get_exception_state(DifftestExceptionState *state, size_t size)
+{
+    CPUARMState *env;
+
+    if (!difftest_initialized || !state || size != sizeof(*state)) {
+        return -EINVAL;
+    }
+    env = difftest_env();
+    state->entered = difftest_exception_entered;
+    state->pc = env->pc;
+    state->pstate = pstate_read(env);
+    for (unsigned int el = 1; el <= 3; el++) {
+        state->spsr[el - 1] = *difftest_spsr_ptr(env, el);
+        state->elr[el - 1] = env->elr_el[el];
+        state->esr[el - 1] = env->cp15.esr_el[el];
+        state->far[el - 1] = env->cp15.far_el[el];
+    }
+    return 0;
+}
+
 int difftest_init(const char *platform)
 {
     char *argv[] = {
@@ -133,6 +164,8 @@ int difftest_init(const char *platform)
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, false);
     cpu_single_step(difftest_cpu,
                     SSTEP_ENABLE | SSTEP_NOIRQ | SSTEP_NOTIMER);
+    arm_register_el_change_hook(ARM_CPU(difftest_cpu),
+                                difftest_exception_entry_hook, NULL);
     difftest_init_reg_ptrs();
     difftest_initialized = true;
 
@@ -147,6 +180,8 @@ int difftest_step(uint64_t n)
     if (!difftest_initialized || !difftest_cpu) {
         return -EINVAL;
     }
+
+    difftest_exception_entered = false;
 
     if (n) {
         difftest_has_stepped = true;
@@ -273,6 +308,21 @@ int difftest_getmisc(uint32_t regid, uint64_t *value)
         return 0;
     case DIFFTEST_MISC_SP_EL3:
         *value = difftest_get_sp_el(env, 3);
+        return 0;
+    case DIFFTEST_MISC_TPIDR_EL0:
+        *value = env->cp15.tpidr_el[0];
+        return 0;
+    case DIFFTEST_MISC_TPIDRRO_EL0:
+        *value = env->cp15.tpidrro_el[0];
+        return 0;
+    case DIFFTEST_MISC_TPIDR_EL1:
+        *value = env->cp15.tpidr_el[1];
+        return 0;
+    case DIFFTEST_MISC_TPIDR_EL2:
+        *value = env->cp15.tpidr_el[2];
+        return 0;
+    case DIFFTEST_MISC_TPIDR_EL3:
+        *value = env->cp15.tpidr_el[3];
         return 0;
     default:
         return -ENOTSUP;
